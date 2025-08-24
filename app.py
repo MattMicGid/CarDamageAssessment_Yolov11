@@ -17,7 +17,7 @@ st.set_page_config(page_title="Car Damage Detection", layout="wide", page_icon="
 st.title("🚗 Car Damage Detection - YOLOv11")
 
 # Constants
-WEIGHTS_FILE = "best.pt"
+WEIGHTS_FILE = "epoch10.pt"
 DEFAULT_CONF = 0.25
 DEFAULT_IOU = 0.7
 DEFAULT_IMGSZ = 640
