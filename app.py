@@ -2,11 +2,18 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 import pandas as pd
-from ultralytics import YOLO
 import io, zipfile
 import os
 from typing import List, Dict, Any
 import tempfile
+
+# Handle OpenCV import for Streamlit Cloud
+try:
+    from ultralytics import YOLO
+except ImportError as e:
+    st.error(f"❌ Error importing YOLO: {str(e)}")
+    st.info("This might be due to OpenCV compatibility issues. Please check the deployment logs.")
+    st.stop()
 
 # ==========================
 # App Config
