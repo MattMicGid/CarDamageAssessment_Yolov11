@@ -3,45 +3,71 @@ from PIL import Image
 import numpy as np
 import pandas as pd
 import io, zipfile
-import os
-from typing import List, Dict, Any
 import tempfile
+from datetime import datetime
+from pathlib import Path
 
-# Handle OpenCV import for Streamlit Cloud
-try:
-    from ultralytics import YOLO
-except ImportError as e:
-    st.error(f"❌ Error importing YOLO: {str(e)}")
-    st.info("This might be due to OpenCV compatibility issues. Please check the deployment logs.")
-    st.stop()
+# Import YOLO - ultralytics handles OpenCV internally
+from ultralytics import YOLO
 
 # ==========================
 # App Config
 # ==========================
 st.set_page_config(page_title="Car Damage Detection", layout="wide", page_icon="🚗")
-st.title("🚗 Car Damage Detection App")
+st.title("🚗 Car Damage Detection - YOLOv11")
 
-# Model weights path
+# Constants
 WEIGHTS_FILE = "best.pt"
+DEFAULT_CONF = 0.25
+DEFAULT_IOU = 0.7
+DEFAULT_IMGSZ = 640
 
-# Damage severity mapping
-DAMAGE_SEVERITY = {
-    "scratch": 1,       # cosmetic
-    "dent": 2,          # bodywork needed  
-    "crack": 3,         # structural concern
-    "glass_shatter": 3, # safety issue
-    "lamp_broken": 2,   # functional issue
-    "tire_flat": 2      # operational issue
-}
+# Severity thresholds
+SEVERITY_T1 = 0.25  # < 25% = Light
+SEVERITY_T2 = 0.60  # 25-60% = Medium, >60% = Heavy
 
 # ==========================
-# Model Loading Functions
+# Utility Functions (dari kode lama Anda)
+# ==========================
+def to_pil_rgb(arr_bgr_or_rgb):
+    """Convert ultralytics result.plot() BGR array to PIL RGB."""
+    if arr_bgr_or_rgb is None:
+        return None
+    a = arr_bgr_or_rgb
+    if a.ndim == 3 and a.shape[2] == 3:
+        # Ultralytics plot() returns BGR, convert to RGB
+        a = a[:, :, ::-1].copy()
+    return Image.fromarray(a)
+
+def compute_severity(mask_bin: np.ndarray, xyxy: np.ndarray):
+    """Calculate severity based on mask area ratio to bbox area."""
+    x1, y1, x2, y2 = [int(v) for v in xyxy]
+    bbox_area = max(1, (x2 - x1) * (y2 - y1))
+    mask_area = int(mask_bin.sum())
+    ratio = float(mask_area) / float(bbox_area)
+    
+    if ratio < SEVERITY_T1:
+        severity = "Light"
+    elif ratio < SEVERITY_T2:
+        severity = "Medium" 
+    else:
+        severity = "Heavy"
+        
+    return mask_area, bbox_area, ratio, severity
+
+def bytes_from_pil(pil_img: Image.Image, fmt="JPEG"):
+    """Convert PIL image to bytes."""
+    buf = io.BytesIO()
+    pil_img.save(buf, format=fmt)
+    return buf.getvalue()
+
+# ==========================
+# Model Loading
 # ==========================
 @st.cache_resource(show_spinner=True)
 def load_model_from_file(uploaded_file):
     """Load YOLO model from uploaded file."""
     try:
-        # Save to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp_file:
             tmp_file.write(uploaded_file.read())
             tmp_path = tmp_file.name
@@ -57,7 +83,7 @@ def load_model_from_file(uploaded_file):
 def load_model_from_path():
     """Load YOLO model from local path."""
     try:
-        if os.path.exists(WEIGHTS_FILE):
+        if Path(WEIGHTS_FILE).exists():
             model = YOLO(WEIGHTS_FILE)
             st.success("✅ Model loaded from local file!")
             return model
@@ -68,103 +94,84 @@ def load_model_from_path():
         return None
 
 # ==========================
-# Severity Calculation
+# Inference Function (seperti kode lama)
 # ==========================
-def calculate_severity(damage_type: str, confidence: float, bbox_area_ratio: float) -> str:
-    """
-    Calculate damage severity based on:
-    1. Damage Type Priority (60%)
-    2. Detection Confidence (25%) 
-    3. Size Factor (15%)
-    """
-    # Get damage type score
-    type_score = DAMAGE_SEVERITY.get(damage_type.lower().replace(' ', '_'), 1)
+def run_inference_on_image(model, pil_img: Image.Image, conf=DEFAULT_CONF, iou=DEFAULT_IOU, imgsz=DEFAULT_IMGSZ):
+    """Run inference on single image, return overlay and detection records."""
     
-    # Size factor (normalize bbox area)
-    size_factor = min(bbox_area_ratio * 10, 3)  # cap at 3
+    # Run prediction
+    results = model.predict(source=pil_img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
+    r = results[0]  # Single image result
     
-    # Calculate final score
-    final_score = (type_score * 0.6) + (confidence * 0.25 * 3) + (size_factor * 0.15)
+    # Get annotated overlay
+    annotated = r.plot()
+    overlay_pil = to_pil_rgb(annotated)
     
-    # Classify severity
-    if final_score < 1.5:
-        return "Minor"
-    elif final_score < 2.5:
-        return "Moderate"
-    else:
-        return "Severe"
-
-# ==========================
-# Detection Function
-# ==========================
-def run_detection(model: YOLO, images: List[Image.Image], conf_threshold: float):
-    """Run YOLO detection on multiple images."""
-    all_results = []
-    annotated_images = []
+    # Extract detection data
+    records = []
+    names_map = r.names  # {id: name}
+    boxes = getattr(r, "boxes", None)
+    masks = getattr(r, "masks", None)
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, image in enumerate(images):
-        status_text.text(f"Processing image {i+1}/{len(images)}...")
-        progress_bar.progress((i + 1) / len(images))
+    if boxes is not None and len(boxes) > 0:
+        xyxy = boxes.xyxy.cpu().numpy()
+        cls = boxes.cls.cpu().numpy().astype(int)
+        confs = boxes.conf.cpu().numpy()
         
-        # Convert to RGB array
-        img_array = np.array(image.convert("RGB"))
-        h, w = img_array.shape[:2]
-        
-        # Run inference
-        results = model.predict(img_array, conf=conf_threshold, verbose=False)[0]
-        
-        # Get annotated image
-        annotated = results.plot()
-        annotated = annotated[:, :, ::-1]  # BGR to RGB
-        annotated_images.append(Image.fromarray(annotated))
-        
-        # Extract detections
-        if results.boxes is not None and len(results.boxes) > 0:
-            boxes = results.boxes.xyxy.cpu().numpy()
-            confidences = results.boxes.conf.cpu().numpy()
-            class_ids = results.boxes.cls.cpu().numpy().astype(int)
+        # Handle masks if available
+        if masks is not None and masks.data is not None:
+            m = masks.data  # (N, H, W) float 0..1
+            mask_np = (m.cpu().numpy() > 0.5).astype(np.uint8)
+        else:
+            mask_np = None
             
-            for j, (box, conf, cls_id) in enumerate(zip(boxes, confidences, class_ids)):
-                x1, y1, x2, y2 = box
-                bbox_area = (x2 - x1) * (y2 - y1)
-                bbox_area_ratio = bbox_area / (w * h)
+        # Process each detection
+        for i in range(len(xyxy)):
+            cls_id = int(cls[i])
+            cls_name = names_map.get(cls_id, str(cls_id))
+            conf_i = float(confs[i])
+            xyxy_i = xyxy[i]
+            
+            # Calculate severity
+            if mask_np is not None and i < mask_np.shape[0]:
+                mask_area, bbox_area, ratio, severity = compute_severity(mask_np[i], xyxy_i)
+            else:
+                # Fallback for bbox-only models
+                bbox_area = max(1, int((xyxy_i[2]-xyxy_i[0])*(xyxy_i[3]-xyxy_i[1])))
+                mask_area, ratio, severity = 0, 0.0, "Light"
                 
-                damage_type = results.names.get(cls_id, f"class_{cls_id}")
-                severity = calculate_severity(damage_type, conf, bbox_area_ratio)
-                
-                all_results.append({
-                    'image_idx': i + 1,
-                    'damage_type': damage_type,
-                    'confidence': round(float(conf), 3),
-                    'severity': severity,
-                    'bbox_area_ratio': round(bbox_area_ratio, 4)
-                })
-    
-    status_text.empty()
-    progress_bar.empty()
-    
-    return all_results, annotated_images
+            records.append({
+                "class_id": cls_id,
+                "class_name": cls_name,
+                "confidence": conf_i,
+                "x1": int(xyxy_i[0]), "y1": int(xyxy_i[1]),
+                "x2": int(xyxy_i[2]), "y2": int(xyxy_i[3]),
+                "mask_area": int(mask_area),
+                "bbox_area": int(bbox_area), 
+                "area_ratio": float(ratio),
+                "severity": severity
+            })
+            
+    return overlay_pil, records
 
 # ==========================
-# Sidebar - Model Loading
+# Session State
+# ==========================
+if "entries" not in st.session_state:
+    st.session_state.entries = []  # List of {plate, files: [(name, bytes), ...]}
+
+# ==========================
+# Sidebar - Model & Input
 # ==========================
 with st.sidebar:
     st.header("🔧 Setup")
     
-    # Try to load local model first
+    # Model loading
     model = load_model_from_path()
     
-    # If no local model, allow upload
     if model is None:
-        st.warning("⚠️ Model file 'best.pt' not found!")
-        uploaded_model = st.file_uploader(
-            "Upload YOLO model (.pt file)", 
-            type=['pt'], 
-            help="Upload your trained YOLOv11 model file"
-        )
+        st.warning("⚠️ Model 'best.pt' not found!")
+        uploaded_model = st.file_uploader("Upload YOLO model (.pt)", type=['pt'])
         
         if uploaded_model:
             model = load_model_from_file(uploaded_model)
@@ -173,177 +180,192 @@ with st.sidebar:
     
     # Detection settings
     st.subheader("⚙️ Detection Settings")
-    conf_threshold = st.slider(
-        "Confidence Threshold", 
-        min_value=0.1, 
-        max_value=0.9, 
-        value=0.25, 
-        step=0.05,
-        help="Higher values = more strict detection"
-    )
+    conf_threshold = st.slider("Confidence", 0.05, 0.95, DEFAULT_CONF, 0.05)
+    img_size = st.selectbox("Image Size", [320, 640, 960, 1280], index=1)
+    
+    st.divider()
+    
+    # Input section
+    st.header("📝 Add Vehicle")
+    plate = st.text_input("Plate Number", placeholder="B 1234 ABC")
+    files = st.file_uploader("Upload Images", type=["jpg","jpeg","png"], accept_multiple_files=True)
+    
+    add_btn = st.button("➕ Add to Queue", use_container_width=True)
+    
+    if add_btn:
+        if not plate:
+            st.warning("Please enter plate number")
+        elif not files:
+            st.warning("Please upload at least 1 image")
+        else:
+            # Store file bytes
+            packed_files = [(f.name, f.read()) for f in files]
+            st.session_state.entries.append({
+                "plate": plate.strip(), 
+                "files": packed_files
+            })
+            st.success(f"Added: {plate} ({len(packed_files)} images)")
+    
+    st.divider()
+    
+    # Show queue
+    if st.session_state.entries:
+        st.subheader("📋 Processing Queue")
+        for idx, entry in enumerate(st.session_state.entries):
+            st.text(f"• {entry['plate']} — {len(entry['files'])} images")
+        
+        if st.button("🗑️ Clear Queue", use_container_width=True):
+            st.session_state.entries = []
+            st.success("Queue cleared!")
 
 # ==========================
-# Main App Interface
+# Main Processing Interface
 # ==========================
 if model is None:
     st.error("❌ Please load a model first!")
     st.stop()
 
-# Input section
-st.header("📝 Input")
-col1, col2 = st.columns([1, 3])
-
-with col1:
-    plate_number = st.text_input(
-        "Plate Number (Optional)", 
-        placeholder="e.g., B 1234 ABC",
-        help="For identification purposes"
-    )
-
-with col2:
-    uploaded_images = st.file_uploader(
-        "Upload Car Images", 
-        type=['jpg', 'jpeg', 'png'], 
-        accept_multiple_files=True,
-        help="Upload multiple images of the car damage"
-    )
-
-# Process button
-if uploaded_images:
-    if st.button("🔍 Analyze Damage", type="primary", use_container_width=True):
-        # Convert uploaded files to PIL images
-        images = [Image.open(img) for img in uploaded_images]
-        
-        # Run detection
-        detections, annotated_images = run_detection(model, images, conf_threshold)
-        
-        # Store results in session state
-        st.session_state['detections'] = detections
-        st.session_state['annotated_images'] = annotated_images
-        st.session_state['original_images'] = images
-        st.session_state['plate_number'] = plate_number or "Unknown"
-
-# ==========================
-# Results Display
-# ==========================
-if 'detections' in st.session_state:
-    detections = st.session_state['detections']
-    annotated_images = st.session_state['annotated_images']
-    original_images = st.session_state['original_images']
-    plate = st.session_state['plate_number']
+if not st.session_state.entries:
+    st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
+else:
+    st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
     
-    st.header("📊 Analysis Results")
+    # Show summary
+    total_images = sum(len(entry['files']) for entry in st.session_state.entries)
+    st.metric("Total Images to Process", total_images)
     
-    # Summary Card
-    if detections:
-        df = pd.DataFrame(detections)
-        total_damage = len(detections)
-        severity_counts = df['severity'].value_counts()
-        highest_severity = df.loc[df['severity'].map({'Minor': 1, 'Moderate': 2, 'Severe': 3}).idxmax(), 'severity']
+    process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
+    
+    if process_btn:
+        st.header("📊 Processing Results")
         
-        # Display summary
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("🚗 Vehicle", plate)
-        with col2:
-            st.metric("📷 Images", len(original_images))
-        with col3:
-            st.metric("⚠️ Damage Found", total_damage)
-        with col4:
-            severity_color = {"Minor": "🟢", "Moderate": "🟡", "Severe": "🔴"}
-            st.metric("📈 Max Severity", f"{severity_color.get(highest_severity, '⚪')} {highest_severity}")
+        all_records = []
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
         
-        st.divider()
-        
-        # Damage Breakdown
-        st.subheader("🔍 Damage Breakdown")
-        
-        # Create summary table
-        summary_data = []
-        for damage_type in df['damage_type'].unique():
-            type_df = df[df['damage_type'] == damage_type]
-            severity_dist = type_df['severity'].value_counts()
+        # Temporary directory for ZIP export
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            orig_dir = tmp_root / "original"
+            seg_dir = tmp_root / "segmented"
+            orig_dir.mkdir(parents=True, exist_ok=True)
+            seg_dir.mkdir(parents=True, exist_ok=True)
             
-            summary_data.append({
-                'Damage Type': damage_type.title(),
-                'Count': len(type_df),
-                'Minor': severity_dist.get('Minor', 0),
-                'Moderate': severity_dist.get('Moderate', 0),
-                'Severe': severity_dist.get('Severe', 0)
-            })
-        
-        summary_df = pd.DataFrame(summary_data)
-        st.dataframe(summary_df, use_container_width=True)
-        
-    else:
-        st.success("✅ No damage detected in the uploaded images!")
-    
-    st.divider()
-    
-    # Image Gallery
-    st.subheader("🖼️ Image Gallery")
-    
-    for i, (original, annotated) in enumerate(zip(original_images, annotated_images)):
-        st.markdown(f"**Image {i+1}**")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(original, caption=f"Original - Image {i+1}", use_container_width=True)
-        with col2:
-            st.image(annotated, caption=f"Detection Results - Image {i+1}", use_container_width=True)
-        
-        # Show detections for this image
-        image_detections = [d for d in detections if d['image_idx'] == i+1]
-        if image_detections:
-            image_df = pd.DataFrame(image_detections)
-            st.dataframe(image_df[['damage_type', 'confidence', 'severity']], use_container_width=True)
-        else:
-            st.info("No damage detected in this image")
-        
-        st.divider()
-    
-    # ==========================
-    # Export Options
-    # ==========================
-    st.header("⬇️ Export Results")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if detections:
-            # CSV Export
-            export_df = pd.DataFrame(detections)
-            export_df.insert(0, 'plate_number', plate)
-            csv_data = export_df.to_csv(index=False)
+            processed_count = 0
             
+            # Process each vehicle
+            for entry in st.session_state.entries:
+                plate = entry["plate"]
+                st.subheader(f"🚗 Processing: {plate}")
+                
+                for file_idx, (filename, file_bytes) in enumerate(entry["files"], 1):
+                    processed_count += 1
+                    status_text.text(f"Processing {plate} — {filename} ({processed_count}/{total_images})")
+                    
+                    # Load image
+                    pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+                    
+                    # Run inference
+                    overlay_pil, detections = run_inference_on_image(
+                        model, pil_img, conf=conf_threshold, imgsz=img_size
+                    )
+                    
+                    # Display results
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.image(pil_img, caption=f"Original - {filename}", use_container_width=True)
+                    with col2:
+                        st.image(overlay_pil or pil_img, caption=f"Detection - {filename}", use_container_width=True)
+                    
+                    # Save images for export
+                    safe_plate = plate.replace(" ", "_")
+                    orig_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).name}"
+                    seg_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).stem}_detected.jpg"
+                    
+                    (orig_dir / orig_name).write_bytes(bytes_from_pil(pil_img, "JPEG"))
+                    (seg_dir / seg_name).write_bytes(bytes_from_pil(overlay_pil or pil_img, "JPEG"))
+                    
+                    # Store detection records
+                    if detections:
+                        for det_idx, detection in enumerate(detections, 1):
+                            record = {
+                                "plate": plate,
+                                "image": orig_name,
+                                "detection_id": det_idx,
+                                **detection
+                            }
+                            all_records.append(record)
+                    else:
+                        # No detections found
+                        all_records.append({
+                            "plate": plate,
+                            "image": orig_name, 
+                            "detection_id": 0,
+                            "class_id": -1,
+                            "class_name": "no_detection",
+                            "confidence": 0.0,
+                            "x1": 0, "y1": 0, "x2": 0, "y2": 0,
+                            "mask_area": 0,
+                            "bbox_area": 0,
+                            "area_ratio": 0.0,
+                            "severity": "None"
+                        })
+                    
+                    progress_bar.progress(processed_count / total_images)
+                
+                st.divider()
+            
+            # Create results DataFrame
+            df = pd.DataFrame(all_records)
+            csv_path = tmp_root / "detection_results.csv"
+            df.to_csv(csv_path, index=False)
+            
+            # Display final results
+            st.header("📋 Final Results Summary")
+            st.success(f"✅ Processing complete! Found {len(df)} total detections.")
+            
+            # Summary metrics
+            if len(df) > 0 and df['class_id'].iloc[0] != -1:
+                damage_summary = df[df['class_id'] != -1].groupby('class_name').agg({
+                    'detection_id': 'count',
+                    'severity': lambda x: x.value_counts().to_dict()
+                }).rename(columns={'detection_id': 'count'})
+                st.dataframe(damage_summary, use_container_width=True)
+            
+            st.dataframe(df, use_container_width=True)
+            
+            # Create ZIP download
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                # Add CSV
+                zf.write(str(csv_path), arcname="detection_results.csv")
+                
+                # Add images
+                for img_path in orig_dir.rglob("*"):
+                    if img_path.is_file():
+                        zf.write(str(img_path), arcname=f"original/{img_path.name}")
+                        
+                for img_path in seg_dir.rglob("*"):
+                    if img_path.is_file():
+                        zf.write(str(img_path), arcname=f"segmented/{img_path.name}")
+            
+            zip_buffer.seek(0)
+            
+            # Download button
             st.download_button(
-                label="📄 Download CSV Report",
-                data=csv_data,
-                file_name=f"damage_report_{plate.replace(' ', '_')}.csv",
-                mime="text/csv",
+                label="⬇️ Download Results (ZIP)",
+                data=zip_buffer,
+                file_name=f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
                 use_container_width=True
             )
-    
-    with col2:
-        # ZIP Export (annotated images)
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for i, img in enumerate(annotated_images):
-                img_buffer = io.BytesIO()
-                img.save(img_buffer, format='JPEG', quality=90)
-                zip_file.writestr(f"annotated_image_{i+1:02d}.jpg", img_buffer.getvalue())
-        
-        st.download_button(
-            label="🖼️ Download Annotated Images (ZIP)",
-            data=zip_buffer.getvalue(),
-            file_name=f"annotated_images_{plate.replace(' ', '_')}.zip",
-            mime="application/zip",
-            use_container_width=True
-        )
+            
+        status_text.empty()
+        progress_bar.empty()
 
 # ==========================
 # Footer
 # ==========================
 st.divider()
-st.caption("⚠️ **Disclaimer:** Severity assessment is automated and should be validated by professional inspection.")
-st.caption("🔧 **Model Info:** YOLOv11 Instance Segmentation for Car Damage Detection")
+st.caption("🔧 Car Damage Detection using YOLOv11 Instance Segmentation")
+st.caption("⚠️ Automated severity assessment - verify with professional inspection")
