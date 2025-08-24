@@ -378,8 +378,6 @@ st.caption("⚠️ Automated severity assessment - verify with professional insp
 if add_btn:
         if not plate:
             st.warning("Masukkan nomor plat terlebih dahulu")
-        elif not validate_indonesian_plate(plate):
-            st.warning("Format plat tidak valid! Contoh: B 1234 ABC")
         elif not files:
             st.warning("Upload minimal 1 gambar")
         else:
