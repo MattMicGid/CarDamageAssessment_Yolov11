@@ -73,7 +73,6 @@ def load_model_from_file(uploaded_file):
             tmp_path = tmp_file.name
         
         model = YOLO(tmp_path)
-        st.success("✅ Model loaded successfully!")
         return model
     except Exception as e:
         st.error(f"❌ Error loading model: {str(e)}")
@@ -85,7 +84,6 @@ def load_model_from_path():
     try:
         if Path(WEIGHTS_FILE).exists():
             model = YOLO(WEIGHTS_FILE)
-            st.success("✅ Model loaded from local file!")
             return model
         else:
             return None
@@ -161,12 +159,10 @@ if "entries" not in st.session_state:
     st.session_state.entries = []  # List of {plate, files: [(name, bytes), ...]}
 
 # ==========================
-# Sidebar - Model & Input
+# Sidebar - Input Only
 # ==========================
 with st.sidebar:
-    st.header("🔧 Setup")
-    
-    # Model loading
+    # Model loading (silent)
     model = load_model_from_path()
     
     if model is None:
@@ -175,48 +171,242 @@ with st.sidebar:
         
         if uploaded_model:
             model = load_model_from_file(uploaded_model)
-    
-    st.divider()
-    
-    # Detection settings
-    st.subheader("⚙️ Detection Settings")
-    conf_threshold = st.slider("Confidence", 0.05, 0.95, DEFAULT_CONF, 0.05)
-    img_size = st.selectbox("Image Size", [320, 640, 960, 1280], index=1)
-    
+            
     st.divider()
     
     # Input section
     st.header("📝 Add Vehicle")
-    plate = st.text_input("Plate Number", placeholder="B 1234 ABC")
-    files = st.file_uploader("Upload Images", type=["jpg","jpeg","png"], accept_multiple_files=True)
+    
+    # Initialize input states
+    if "input_plate" not in st.session_state:
+        st.session_state.input_plate = ""
+    if "clear_inputs" not in st.session_state:
+        st.session_state.clear_inputs = False
+    
+    # Clear inputs after successful add
+    if st.session_state.clear_inputs:
+        st.session_state.input_plate = ""
+        st.session_state.clear_inputs = False
+        st.rerun()
+    
+    # Plate input with Indonesian format validation
+    plate = st.text_input(
+        "Plate Number", 
+        value=st.session_state.input_plate,
+        placeholder="B 1234 ABC",
+        max_chars=11,  # Max length for Indonesian plates
+        help="Format: [A-Z] [1-4 digits] [A-Z][A-Z][A-Z]"
+    )
+    
+    files = st.file_uploader(
+        "Upload Images", 
+        type=["jpg","jpeg","png"], 
+        accept_multiple_files=True,
+        key=f"file_uploader_{len(st.session_state.entries)}"  # Force refresh
+    )
     
     add_btn = st.button("➕ Add to Queue", use_container_width=True)
     
-    if add_btn:
+# ==========================
+# Main Processing Interface
+# ==========================
+if model is None:
+    st.error("❌ Please load a model first!")
+    st.stop()
+
+if not st.session_state.entries:
+    st.info("👆 Tambahkan kendaraan ke queue menggunakan sidebar, lalu klik **Process All** di bawah.")
+    
+    # Detection Settings di main area
+    st.header("⚙️ Detection Settings")
+    col1, col2 = st.columns(2)
+    with col1:
+        conf_threshold = st.slider("Confidence Threshold", 0.05, 0.95, DEFAULT_CONF, 0.05)
+    with col2:
+        img_size = st.selectbox("Image Size", [320, 640, 960, 1280], index=1)
+else:
+    st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
+    
+    # Detection Settings
+    st.subheader("⚙️ Detection Settings")
+    col1, col2 = st.columns(2)
+    with col1:
+        conf_threshold = st.slider("Confidence Threshold", 0.05, 0.95, DEFAULT_CONF, 0.05)
+    with col2:
+        img_size = st.selectbox("Image Size", [320, 640, 960, 1280], index=1)
+    
+    # Show summary
+    total_images = sum(len(entry['files']) for entry in st.session_state.entries)
+    st.metric("Total Images to Process", total_images)
+    
+    process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
+    
+    if process_btn:
+        st.header("📊 Processing Results")
+        
+        all_records = []
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        
+        # Temporary directory for ZIP export
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            orig_dir = tmp_root / "original"
+            seg_dir = tmp_root / "segmented"
+            orig_dir.mkdir(parents=True, exist_ok=True)
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            
+            processed_count = 0
+            
+            # Process each vehicle
+            for entry in st.session_state.entries:
+                plate = entry["plate"]
+                st.subheader(f"🚗 Processing: {plate}")
+                
+                for file_idx, (filename, file_bytes) in enumerate(entry["files"], 1):
+                    processed_count += 1
+                    status_text.text(f"Processing {plate} — {filename} ({processed_count}/{total_images})")
+                    
+                    # Load image
+                    pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+                    
+                    # Run inference
+                    overlay_pil, detections = run_inference_on_image(
+                        model, pil_img, conf=conf_threshold, imgsz=img_size
+                    )
+                    
+                    # Display results
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.image(pil_img, caption=f"Original - {filename}", use_container_width=True)
+                    with col2:
+                        st.image(overlay_pil or pil_img, caption=f"Detection - {filename}", use_container_width=True)
+                    
+                    # Save images for export
+                    safe_plate = plate.replace(" ", "_")
+                    orig_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).name}"
+                    seg_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).stem}_detected.jpg"
+                    
+                    (orig_dir / orig_name).write_bytes(bytes_from_pil(pil_img, "JPEG"))
+                    (seg_dir / seg_name).write_bytes(bytes_from_pil(overlay_pil or pil_img, "JPEG"))
+                    
+                    # Store detection records
+                    if detections:
+                        for det_idx, detection in enumerate(detections, 1):
+                            record = {
+                                "plate": plate,
+                                "image": orig_name,
+                                "detection_id": det_idx,
+                                **detection
+                            }
+                            all_records.append(record)
+                    else:
+                        # No detections found
+                        all_records.append({
+                            "plate": plate,
+                            "image": orig_name, 
+                            "detection_id": 0,
+                            "class_id": -1,
+                            "class_name": "no_detection",
+                            "confidence": 0.0,
+                            "x1": 0, "y1": 0, "x2": 0, "y2": 0,
+                            "mask_area": 0,
+                            "bbox_area": 0,
+                            "area_ratio": 0.0,
+                            "severity": "None"
+                        })
+                    
+                    progress_bar.progress(processed_count / total_images)
+                
+                st.divider()
+            
+            # Create results DataFrame
+            df = pd.DataFrame(all_records)
+            csv_path = tmp_root / "detection_results.csv"
+            df.to_csv(csv_path, index=False)
+            
+            # Display final results
+            st.header("📋 Final Results Summary")
+            st.success(f"✅ Processing complete! Found {len(df)} total detections.")
+            
+            # Summary metrics
+            if len(df) > 0 and df['class_id'].iloc[0] != -1:
+                damage_summary = df[df['class_id'] != -1].groupby('class_name').agg({
+                    'detection_id': 'count',
+                    'severity': lambda x: x.value_counts().to_dict()
+                }).rename(columns={'detection_id': 'count'})
+                st.dataframe(damage_summary, use_container_width=True)
+            
+            st.dataframe(df, use_container_width=True)
+            
+            # Create ZIP download
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                # Add CSV
+                zf.write(str(csv_path), arcname="detection_results.csv")
+                
+                # Add images
+                for img_path in orig_dir.rglob("*"):
+                    if img_path.is_file():
+                        zf.write(str(img_path), arcname=f"original/{img_path.name}")
+                        
+                for img_path in seg_dir.rglob("*"):
+                    if img_path.is_file():
+                        zf.write(str(img_path), arcname=f"segmented/{img_path.name}")
+            
+            zip_buffer.seek(0)
+            
+            # Download button
+            st.download_button(
+                label="⬇️ Download Results (ZIP)",
+                data=zip_buffer,
+                file_name=f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+            
+        status_text.empty()
+        progress_bar.empty()
+
+# ==========================
+# Footer
+# ==========================
+st.divider()
+st.caption("🔧 Car Damage Detection using YOLOv11 Instance Segmentation")
+st.caption("⚠️ Automated severity assessment - verify with professional inspection")
+    
+if add_btn:
         if not plate:
-            st.warning("Please enter plate number")
+            st.warning("Masukkan nomor plat terlebih dahulu")
+        elif not validate_indonesian_plate(plate):
+            st.warning("Format plat tidak valid! Contoh: B 1234 ABC")
         elif not files:
-            st.warning("Please upload at least 1 image")
+            st.warning("Upload minimal 1 gambar")
         else:
             # Store file bytes
             packed_files = [(f.name, f.read()) for f in files]
             st.session_state.entries.append({
-                "plate": plate.strip(), 
+                "plate": plate.upper().strip(), 
                 "files": packed_files
             })
-            st.success(f"Added: {plate} ({len(packed_files)} images)")
+            st.success(f"Ditambahkan: {plate.upper()} ({len(packed_files)} gambar)")
+            
+            # Clear inputs
+            st.session_state.clear_inputs = True
+            st.rerun()
     
-    st.divider()
+st.divider()
     
     # Show queue
-    if st.session_state.entries:
+if st.session_state.entries:
         st.subheader("📋 Processing Queue")
         for idx, entry in enumerate(st.session_state.entries):
-            st.text(f"• {entry['plate']} — {len(entry['files'])} images")
+            st.text(f"• {entry['plate']} — {len(entry['files'])} gambar")
         
         if st.button("🗑️ Clear Queue", use_container_width=True):
             st.session_state.entries = []
-            st.success("Queue cleared!")
+            st.session_state.clear_inputs = True  # Also clear inputs
+            st.success("Queue dikosongkan!")
 
 # ==========================
 # Main Processing Interface
