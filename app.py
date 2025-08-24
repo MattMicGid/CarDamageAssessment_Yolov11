@@ -27,7 +27,7 @@ SEVERITY_T1 = 0.25  # < 25% = Light
 SEVERITY_T2 = 0.60  # 25-60% = Medium, >60% = Heavy
 
 # ==========================
-# Utility Functions (dari kode lama Anda)
+# Utility Functions
 # ==========================
 def to_pil_rgb(arr_bgr_or_rgb):
     """Convert ultralytics result.plot() BGR array to PIL RGB."""
@@ -92,7 +92,7 @@ def load_model_from_path():
         return None
 
 # ==========================
-# Inference Function (seperti kode lama)
+# Inference Function
 # ==========================
 def run_inference_on_image(model, pil_img: Image.Image, conf=DEFAULT_CONF, iou=DEFAULT_IOU, imgsz=DEFAULT_IMGSZ):
     """Run inference on single image, return overlay and detection records."""
@@ -207,6 +207,39 @@ with st.sidebar:
     
     add_btn = st.button("➕ Add to Queue", use_container_width=True)
     
+    # Handle add button
+    if add_btn:
+        if not plate:
+            st.warning("Masukkan nomor plat terlebih dahulu")
+        elif not files:
+            st.warning("Upload minimal 1 gambar")
+        else:
+            # Store file bytes
+            packed_files = [(f.name, f.read()) for f in files]
+            st.session_state.entries.append({
+                "plate": plate.upper().strip(), 
+                "files": packed_files
+            })
+            st.success(f"Ditambahkan: {plate.upper()} ({len(packed_files)} gambar)")
+            
+            # Clear inputs
+            st.session_state.clear_inputs = True
+            st.rerun()
+    
+    st.divider()
+    
+    # Show queue
+    if st.session_state.entries:
+        st.subheader("📋 Processing Queue")
+        for idx, entry in enumerate(st.session_state.entries):
+            st.text(f"• {entry['plate']} — {len(entry['files'])} gambar")
+        
+        if st.button("🗑️ Clear Queue", use_container_width=True):
+            st.session_state.entries = []
+            st.session_state.clear_inputs = True  # Also clear inputs
+            st.success("Queue dikosongkan!")
+            st.rerun()
+
 # ==========================
 # Main Processing Interface
 # ==========================
@@ -215,9 +248,9 @@ if model is None:
     st.stop()
 
 if not st.session_state.entries:
-    st.info("👆 Tambahkan kendaraan ke queue menggunakan sidebar, lalu klik **Process All** di bawah.")
+    st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
     
-    # Detection Settings di main area
+    # Detection Settings in main area when no entries
     st.header("⚙️ Detection Settings")
     col1, col2 = st.columns(2)
     with col1:
@@ -239,189 +272,7 @@ else:
     total_images = sum(len(entry['files']) for entry in st.session_state.entries)
     st.metric("Total Images to Process", total_images)
     
-    process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
-    
-    if process_btn:
-        st.header("📊 Processing Results")
-        
-        all_records = []
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
-        
-        # Temporary directory for ZIP export
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_root = Path(tmpdir)
-            orig_dir = tmp_root / "original"
-            seg_dir = tmp_root / "segmented"
-            orig_dir.mkdir(parents=True, exist_ok=True)
-            seg_dir.mkdir(parents=True, exist_ok=True)
-            
-            processed_count = 0
-            
-            # Process each vehicle
-            for entry in st.session_state.entries:
-                plate = entry["plate"]
-                st.subheader(f"🚗 Processing: {plate}")
-                
-                for file_idx, (filename, file_bytes) in enumerate(entry["files"], 1):
-                    processed_count += 1
-                    status_text.text(f"Processing {plate} — {filename} ({processed_count}/{total_images})")
-                    
-                    # Load image
-                    pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-                    
-                    # Run inference
-                    overlay_pil, detections = run_inference_on_image(
-                        model, pil_img, conf=conf_threshold, imgsz=img_size
-                    )
-                    
-                    # Display results
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.image(pil_img, caption=f"Original - {filename}", use_container_width=True)
-                    with col2:
-                        st.image(overlay_pil or pil_img, caption=f"Detection - {filename}", use_container_width=True)
-                    
-                    # Save images for export
-                    safe_plate = plate.replace(" ", "_")
-                    orig_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).name}"
-                    seg_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).stem}_detected.jpg"
-                    
-                    (orig_dir / orig_name).write_bytes(bytes_from_pil(pil_img, "JPEG"))
-                    (seg_dir / seg_name).write_bytes(bytes_from_pil(overlay_pil or pil_img, "JPEG"))
-                    
-                    # Store detection records
-                    if detections:
-                        for det_idx, detection in enumerate(detections, 1):
-                            record = {
-                                "plate": plate,
-                                "image": orig_name,
-                                "detection_id": det_idx,
-                                **detection
-                            }
-                            all_records.append(record)
-                    else:
-                        # No detections found
-                        all_records.append({
-                            "plate": plate,
-                            "image": orig_name, 
-                            "detection_id": 0,
-                            "class_id": -1,
-                            "class_name": "no_detection",
-                            "confidence": 0.0,
-                            "x1": 0, "y1": 0, "x2": 0, "y2": 0,
-                            "mask_area": 0,
-                            "bbox_area": 0,
-                            "area_ratio": 0.0,
-                            "severity": "None"
-                        })
-                    
-                    progress_bar.progress(processed_count / total_images)
-                
-                st.divider()
-            
-            # Create results DataFrame
-            df = pd.DataFrame(all_records)
-            csv_path = tmp_root / "detection_results.csv"
-            df.to_csv(csv_path, index=False)
-            
-            # Display final results
-            st.header("📋 Final Results Summary")
-            st.success(f"✅ Processing complete! Found {len(df)} total detections.")
-            
-            # Summary metrics
-            if len(df) > 0 and df['class_id'].iloc[0] != -1:
-                damage_summary = df[df['class_id'] != -1].groupby('class_name').agg({
-                    'detection_id': 'count',
-                    'severity': lambda x: x.value_counts().to_dict()
-                }).rename(columns={'detection_id': 'count'})
-                st.dataframe(damage_summary, use_container_width=True)
-            
-            st.dataframe(df, use_container_width=True)
-            
-            # Create ZIP download
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                # Add CSV
-                zf.write(str(csv_path), arcname="detection_results.csv")
-                
-                # Add images
-                for img_path in orig_dir.rglob("*"):
-                    if img_path.is_file():
-                        zf.write(str(img_path), arcname=f"original/{img_path.name}")
-                        
-                for img_path in seg_dir.rglob("*"):
-                    if img_path.is_file():
-                        zf.write(str(img_path), arcname=f"segmented/{img_path.name}")
-            
-            zip_buffer.seek(0)
-            
-            # Download button
-            st.download_button(
-                label="⬇️ Download Results (ZIP)",
-                data=zip_buffer,
-                file_name=f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-                use_container_width=True
-            )
-            
-        status_text.empty()
-        progress_bar.empty()
-
-# ==========================
-# Footer
-# ==========================
-st.divider()
-st.caption("🔧 Car Damage Detection using YOLOv11 Instance Segmentation")
-st.caption("⚠️ Automated severity assessment - verify with professional inspection")
-    
-if add_btn:
-        if not plate:
-            st.warning("Masukkan nomor plat terlebih dahulu")
-        elif not files:
-            st.warning("Upload minimal 1 gambar")
-        else:
-            # Store file bytes
-            packed_files = [(f.name, f.read()) for f in files]
-            st.session_state.entries.append({
-                "plate": plate.upper().strip(), 
-                "files": packed_files
-            })
-            st.success(f"Ditambahkan: {plate.upper()} ({len(packed_files)} gambar)")
-            
-            # Clear inputs
-            st.session_state.clear_inputs = True
-            st.rerun()
-    
-st.divider()
-    
-    # Show queue
-if st.session_state.entries:
-        st.subheader("📋 Processing Queue")
-        for idx, entry in enumerate(st.session_state.entries):
-            st.text(f"• {entry['plate']} — {len(entry['files'])} gambar")
-        
-        if st.button("🗑️ Clear Queue", use_container_width=True):
-            st.session_state.entries = []
-            st.session_state.clear_inputs = True  # Also clear inputs
-            st.success("Queue dikosongkan!")
-
-# ==========================
-# Main Processing Interface
-# ==========================
-if model is None:
-    st.error("❌ Please load a model first!")
-    st.stop()
-
-if not st.session_state.entries:
-    st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
-else:
-    st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
-    
-    # Show summary
-    total_images = sum(len(entry['files']) for entry in st.session_state.entries)
-    st.metric("Total Images to Process", total_images)
-    
+    # Single Process All button (removed duplicate)
     process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
     
     if process_btn:
