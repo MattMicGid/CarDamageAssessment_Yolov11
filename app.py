@@ -65,20 +65,6 @@ def bytes_from_pil(pil_img: Image.Image, fmt="JPEG"):
 # Model Loading
 # ==========================
 @st.cache_resource(show_spinner=True)
-def load_model_from_file(uploaded_file):
-    """Load YOLO model from uploaded file."""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp_file:
-            tmp_file.write(uploaded_file.read())
-            tmp_path = tmp_file.name
-        
-        model = YOLO(tmp_path)
-        return model
-    except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
-        return None
-
-@st.cache_resource(show_spinner=True)
 def load_model_from_path():
     """Load YOLO model from local path."""
     try:
@@ -88,8 +74,21 @@ def load_model_from_path():
         else:
             return None
     except Exception as e:
-        st.error(f"❌ Error loading local model: {str(e)}")
+        st.error(f"❌ Error loading model: {str(e)}")
         return None
+
+# ==========================
+# Check Model Availability
+# ==========================
+model = load_model_from_path()
+
+if model is None:
+    st.error("❌ **Model file not found!**")
+    st.error(f"Please ensure the model file `{WEIGHTS_FILE}` exists in the application directory.")
+    st.info("📝 **Instructions:**")
+    st.info(f"1. Place your trained YOLO model file named `{WEIGHTS_FILE}` in the same directory as this script")
+    st.info("2. Restart the application")
+    st.stop()
 
 # ==========================
 # Inference Function
@@ -159,21 +158,14 @@ if "entries" not in st.session_state:
     st.session_state.entries = []  # List of {plate, files: [(name, bytes), ...]}
 
 # ==========================
+# Model Info Display
+# ==========================
+st.success(f"✅ **Model loaded successfully:** `{WEIGHTS_FILE}`")
+
+# ==========================
 # Sidebar - Input Only
 # ==========================
 with st.sidebar:
-    # Model loading (silent)
-    model = load_model_from_path()
-    
-    if model is None:
-        st.warning("⚠️ Model 'best.pt' not found!")
-        uploaded_model = st.file_uploader("Upload YOLO model (.pt)", type=['pt'])
-        
-        if uploaded_model:
-            model = load_model_from_file(uploaded_model)
-            
-    st.divider()
-    
     # Input section
     st.header("📝 Add Vehicle")
     
@@ -243,10 +235,6 @@ with st.sidebar:
 # ==========================
 # Main Processing Interface
 # ==========================
-if model is None:
-    st.error("❌ Please load a model first!")
-    st.stop()
-
 if not st.session_state.entries:
     st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
     
@@ -272,7 +260,7 @@ else:
     total_images = sum(len(entry['files']) for entry in st.session_state.entries)
     st.metric("Total Images to Process", total_images)
     
-    # Single Process All button (removed duplicate)
+    # Process All button
     process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
     
     if process_btn:
