@@ -144,10 +144,6 @@ def run_inference_on_image(model, pil_img: Image.Image, conf=DEFAULT_CONF, iou=D
 if "entries" not in st.session_state:
     st.session_state.entries = []  # List of {plate, files: [(name, bytes), ...]}
 
-# ==========================
-# Model Info Display
-# ==========================
-st.success(f"✅ **Model loaded successfully:** `{WEIGHTS_FILE}`")
 
 # ==========================
 # Sidebar - Input Only
