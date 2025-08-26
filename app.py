@@ -78,6 +78,19 @@ def load_model_from_path():
         return None
 
 # ==========================
+# Check Model Availability
+# ==========================
+model = load_model_from_path()
+
+if model is None:
+    st.error("❌ **Model file not found!**")
+    st.error(f"Please ensure the model file `{WEIGHTS_FILE}` exists in the application directory.")
+    st.info("📝 **Instructions:**")
+    st.info(f"1. Place your trained YOLO model file named `{WEIGHTS_FILE}` in the same directory as this script")
+    st.info("2. Restart the application")
+    st.stop()
+
+# ==========================
 # Inference Function
 # ==========================
 def run_inference_on_image(model, pil_img: Image.Image, conf=DEFAULT_CONF, iou=DEFAULT_IOU, imgsz=DEFAULT_IMGSZ):
@@ -144,6 +157,10 @@ def run_inference_on_image(model, pil_img: Image.Image, conf=DEFAULT_CONF, iou=D
 if "entries" not in st.session_state:
     st.session_state.entries = []  # List of {plate, files: [(name, bytes), ...]}
 
+# ==========================
+# Model Info Display
+# ==========================
+st.success(f"✅ **Model loaded successfully:** `{WEIGHTS_FILE}`")
 
 # ==========================
 # Sidebar - Input Only
