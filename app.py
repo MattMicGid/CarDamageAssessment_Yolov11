@@ -264,6 +264,9 @@ else:
     process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
     
     if process_btn:
+        if model is None:
+            st.error("Model tidak tersedia!")
+            st.stop()
         st.header("📊 Processing Results")
         
         all_records = []
