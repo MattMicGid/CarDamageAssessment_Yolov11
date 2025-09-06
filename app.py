@@ -18,9 +18,10 @@ st.title("🚗 Car Damage Detection - YOLOv11")
 
 # Constants
 WEIGHTS_FILE = "best.pt"
-DEFAULT_CONF = 0.25
-DEFAULT_IOU = 0.7
-DEFAULT_IMGSZ = 640
+# LOKASI: Fixed threshold dan image size values (tidak bisa diubah user)
+FIXED_CONF = 0.25      # Fixed confidence threshold
+FIXED_IOU = 0.7        # Fixed IOU threshold  
+FIXED_IMGSZ = 640      # Fixed image size
 
 # Severity thresholds
 SEVERITY_T1 = 0.25  # < 25% = Light
@@ -61,6 +62,14 @@ def bytes_from_pil(pil_img: Image.Image, fmt="JPEG"):
     pil_img.save(buf, format=fmt)
     return buf.getvalue()
 
+# LOKASI: Function untuk create human-readable summary
+def create_summary_text(plate, class_name, severity):
+    """Create human-readable summary text for Excel export."""
+    if class_name == "no_detection":
+        return f"Mobil dengan nomor plat {plate} tidak terdeteksi mengalami kerusakan."
+    else:
+        return f"Mobil dengan nomor plat {plate} terdeteksi mengalami kerusakan {class_name} dengan tingkat keparahan {severity}."
+
 # ==========================
 # Model Loading
 # ==========================
@@ -93,7 +102,8 @@ if model is None:
 # ==========================
 # Inference Function
 # ==========================
-def run_inference_on_image(model, pil_img: Image.Image, conf=DEFAULT_CONF, iou=DEFAULT_IOU, imgsz=DEFAULT_IMGSZ):
+# LOKASI: Function inference - confidence tidak ditampilkan di hasil
+def run_inference_on_image(model, pil_img: Image.Image, conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ):
     """Run inference on single image, return overlay and detection records."""
     
     # Run prediction
@@ -140,7 +150,7 @@ def run_inference_on_image(model, pil_img: Image.Image, conf=DEFAULT_CONF, iou=D
             records.append({
                 "class_id": cls_id,
                 "class_name": cls_name,
-                "confidence": conf_i,
+                "confidence": conf_i,  # Tetap disimpan tapi tidak ditampilkan
                 "x1": int(xyxy_i[0]), "y1": int(xyxy_i[1]),
                 "x2": int(xyxy_i[2]), "y2": int(xyxy_i[3]),
                 "mask_area": int(mask_area),
@@ -238,23 +248,37 @@ with st.sidebar:
 if not st.session_state.entries:
     st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
     
-    # Detection Settings in main area when no entries
-    st.header("⚙️ Detection Settings")
-    col1, col2 = st.columns(2)
-    with col1:
-        conf_threshold = st.slider("Confidence Threshold", 0.05, 0.95, DEFAULT_CONF, 0.05)
-    with col2:
-        img_size = st.selectbox("Image Size", [320, 640, 960, 1280], index=1)
+    # LOKASI: Legend section (dulu Detection Settings) - tanpa slider/controls
+    st.header("📖 Legend")
+    st.markdown("""
+    **Severity Levels:**
+    - 🟢 **Light**: Kerusakan ringan (< 25% area)
+    - 🟡 **Medium**: Kerusakan sedang (25-60% area)  
+    - 🔴 **Heavy**: Kerusakan berat (> 60% area)
+    
+    **Detection Settings (Fixed):**
+    - Confidence Threshold: 25%
+    - Image Size: 640px
+    """)
 else:
     st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
     
-    # Detection Settings
-    st.subheader("⚙️ Detection Settings")
+    # LOKASI: Legend section (dulu Detection Settings) - tanpa controls
+    st.subheader("📖 Legend")
     col1, col2 = st.columns(2)
     with col1:
-        conf_threshold = st.slider("Confidence Threshold", 0.05, 0.95, DEFAULT_CONF, 0.05)
+        st.markdown("""
+        **Severity Levels:**
+        - 🟢 **Light**: < 25% area
+        - 🟡 **Medium**: 25-60% area  
+        - 🔴 **Heavy**: > 60% area
+        """)
     with col2:
-        img_size = st.selectbox("Image Size", [320, 640, 960, 1280], index=1)
+        st.markdown("""
+        **Detection Settings (Fixed):**
+        - Confidence: 25%
+        - Image Size: 640px
+        """)
     
     # Show summary
     total_images = sum(len(entry['files']) for entry in st.session_state.entries)
@@ -270,6 +294,8 @@ else:
         st.header("📊 Processing Results")
         
         all_records = []
+        # LOKASI: List untuk summary Excel yang human-readable
+        summary_records = []
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         
@@ -295,10 +321,8 @@ else:
                     # Load image
                     pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
                     
-                    # Run inference
-                    overlay_pil, detections = run_inference_on_image(
-                        model, pil_img, conf=conf_threshold, imgsz=img_size
-                    )
+                    # LOKASI: Run inference dengan fixed parameters
+                    overlay_pil, detections = run_inference_on_image(model, pil_img)
                     
                     # Display results
                     col1, col2 = st.columns(2)
@@ -315,9 +339,10 @@ else:
                     (orig_dir / orig_name).write_bytes(bytes_from_pil(pil_img, "JPEG"))
                     (seg_dir / seg_name).write_bytes(bytes_from_pil(overlay_pil or pil_img, "JPEG"))
                     
-                    # Store detection records
+                    # LOKASI: Store detection records dan create summary
                     if detections:
                         for det_idx, detection in enumerate(detections, 1):
+                            # Detailed record (original format)
                             record = {
                                 "plate": plate,
                                 "image": orig_name,
@@ -325,6 +350,14 @@ else:
                                 **detection
                             }
                             all_records.append(record)
+                            
+                            # LOKASI: Human-readable summary record
+                            summary_text = create_summary_text(plate, detection["class_name"], detection["severity"])
+                            summary_records.append({
+                                "plate": plate,
+                                "image": filename,
+                                "summary": summary_text
+                            })
                     else:
                         # No detections found
                         all_records.append({
@@ -340,35 +373,51 @@ else:
                             "area_ratio": 0.0,
                             "severity": "None"
                         })
+                        
+                        # LOKASI: Summary untuk no detection
+                        summary_text = create_summary_text(plate, "no_detection", "None")
+                        summary_records.append({
+                            "plate": plate,
+                            "image": filename,
+                            "summary": summary_text
+                        })
                     
                     progress_bar.progress(processed_count / total_images)
                 
                 st.divider()
             
-            # Create results DataFrame
-            df = pd.DataFrame(all_records)
-            csv_path = tmp_root / "detection_results.csv"
-            df.to_csv(csv_path, index=False)
+            # LOKASI: Create DataFrames - detailed dan summary
+            df_detailed = pd.DataFrame(all_records)
+            df_summary = pd.DataFrame(summary_records)
+            
+            # Save both versions
+            csv_detailed_path = tmp_root / "detection_results_detailed.csv"
+            csv_summary_path = tmp_root / "detection_results_summary.csv"
+            df_detailed.to_csv(csv_detailed_path, index=False)
+            df_summary.to_csv(csv_summary_path, index=False)
             
             # Display final results
             st.header("📋 Final Results Summary")
-            st.success(f"✅ Processing complete! Found {len(df)} total detections.")
+            st.success(f"✅ Processing complete! Found {len(df_detailed)} total detections.")
             
-            # Summary metrics
-            if len(df) > 0 and df['class_id'].iloc[0] != -1:
-                damage_summary = df[df['class_id'] != -1].groupby('class_name').agg({
+            # LOKASI: Summary metrics - tanpa confidence
+            if len(df_detailed) > 0 and df_detailed['class_id'].iloc[0] != -1:
+                damage_summary = df_detailed[df_detailed['class_id'] != -1].groupby('class_name').agg({
                     'detection_id': 'count',
                     'severity': lambda x: x.value_counts().to_dict()
                 }).rename(columns={'detection_id': 'count'})
                 st.dataframe(damage_summary, use_container_width=True)
             
-            st.dataframe(df, use_container_width=True)
+            # LOKASI: Display summary version (human-readable)
+            st.subheader("📄 Summary Report")
+            st.dataframe(df_summary, use_container_width=True)
             
             # Create ZIP download
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                # Add CSV
-                zf.write(str(csv_path), arcname="detection_results.csv")
+                # LOKASI: Add both CSV files
+                zf.write(str(csv_detailed_path), arcname="detection_results_detailed.csv")
+                zf.write(str(csv_summary_path), arcname="detection_results_summary.csv")
                 
                 # Add images
                 for img_path in orig_dir.rglob("*"):
