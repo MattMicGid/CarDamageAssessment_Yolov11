@@ -19,7 +19,7 @@ st.title("🚗 Car Damage Detection - YOLOv11")
 # Constants
 WEIGHTS_FILE = "best.pt"
 # LOKASI: Fixed threshold dan image size values (tidak bisa diubah user)
-FIXED_CONF = 0.25      # Fixed confidence threshold
+FIXED_CONF = 0.15      # Fixed confidence threshold
 FIXED_IOU = 0.7        # Fixed IOU threshold  
 FIXED_IMGSZ = 640      # Fixed image size
 
@@ -269,12 +269,7 @@ else:
         - 🟡 **Medium**: 25-60% area  
         - 🔴 **Heavy**: > 60% area
         """)
-    with col2:
-        st.markdown("""
-        **Detection Settings (Fixed):**
-        - Confidence: 25%
-        - Image Size: 640px
-        """)
+
     
     # Show summary
     total_images = sum(len(entry['files']) for entry in st.session_state.entries)
