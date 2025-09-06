@@ -1,11 +1,12 @@
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import pandas as pd
 import io, zipfile
 import tempfile
 from datetime import datetime
 from pathlib import Path
+import cv2
 
 # Import YOLO - ultralytics handles OpenCV internally
 from ultralytics import YOLO
@@ -19,7 +20,7 @@ st.title("🚗 Car Damage Detection - YOLOv11")
 # Constants
 WEIGHTS_FILE = "best.pt"
 # LOKASI: Fixed threshold dan image size values (tidak bisa diubah user)
-FIXED_CONF = 0.25      # Fixed confidence threshold
+FIXED_CONF = 0.15      # Fixed confidence threshold
 FIXED_IOU = 0.7        # Fixed IOU threshold  
 FIXED_IMGSZ = 640      # Fixed image size
 
@@ -62,6 +63,69 @@ def bytes_from_pil(pil_img: Image.Image, fmt="JPEG"):
     pil_img.save(buf, format=fmt)
     return buf.getvalue()
 
+# LOKASI: Custom plotting function tanpa confidence
+def plot_custom_overlay(pil_img: Image.Image, boxes, masks, names_map):
+    """Create custom overlay without confidence scores."""
+    if boxes is None or len(boxes) == 0:
+        return pil_img
+    
+    # Convert PIL to numpy array for OpenCV
+    img_array = np.array(pil_img)
+    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    
+    xyxy = boxes.xyxy.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    
+    # Color map for different classes
+    colors = [
+        (0, 255, 0),    # Green
+        (255, 0, 0),    # Blue (BGR format)
+        (0, 0, 255),    # Red
+        (255, 255, 0),  # Cyan
+        (255, 0, 255),  # Magenta
+        (0, 255, 255),  # Yellow
+    ]
+    
+    # Draw masks if available
+    if masks is not None and masks.data is not None:
+        mask_data = masks.data.cpu().numpy()
+        for i, mask in enumerate(mask_data):
+            if i < len(cls):
+                cls_id = int(cls[i])
+                color = colors[cls_id % len(colors)]
+                
+                # Create colored mask
+                mask_resized = cv2.resize(mask.astype(np.uint8), (img_bgr.shape[1], img_bgr.shape[0]))
+                mask_colored = np.zeros_like(img_bgr)
+                mask_colored[:, :] = color
+                
+                # Apply mask with transparency
+                alpha = 0.3
+                mask_bool = mask_resized > 0.5
+                img_bgr[mask_bool] = (1 - alpha) * img_bgr[mask_bool] + alpha * mask_colored[mask_bool]
+    
+    # Draw bounding boxes and labels (without confidence)
+    for i in range(len(xyxy)):
+        x1, y1, x2, y2 = xyxy[i].astype(int)
+        cls_id = int(cls[i])
+        cls_name = names_map.get(cls_id, str(cls_id))
+        color = colors[cls_id % len(colors)]
+        
+        # Draw bounding box
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
+        
+        # Draw label background
+        label = cls_name  # Only class name, no confidence
+        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img_bgr, (x1, y1 - text_height - baseline - 5), (x1 + text_width, y1), color, -1)
+        
+        # Draw label text
+        cv2.putText(img_bgr, label, (x1, y1 - baseline - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Convert back to RGB PIL
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img_rgb)
+
 # LOKASI: Function untuk create human-readable summary
 def create_summary_text(plate, class_name, severity):
     """Create human-readable summary text for Excel export."""
@@ -102,7 +166,7 @@ if model is None:
 # ==========================
 # Inference Function
 # ==========================
-# LOKASI: Function inference - confidence tidak ditampilkan di hasil
+# LOKASI: Function inference - dengan custom plotting tanpa confidence
 def run_inference_on_image(model, pil_img: Image.Image, conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ):
     """Run inference on single image, return overlay and detection records."""
     
@@ -110,15 +174,15 @@ def run_inference_on_image(model, pil_img: Image.Image, conf=FIXED_CONF, iou=FIX
     results = model.predict(source=pil_img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
     r = results[0]  # Single image result
     
-    # Get annotated overlay
-    annotated = r.plot()
-    overlay_pil = to_pil_rgb(annotated)
-    
-    # Extract detection data
-    records = []
+    # Get custom annotated overlay (without confidence)
     names_map = r.names  # {id: name}
     boxes = getattr(r, "boxes", None)
     masks = getattr(r, "masks", None)
+    
+    overlay_pil = plot_custom_overlay(pil_img, boxes, masks, names_map)
+    
+    # Extract detection data
+    records = []
     
     if boxes is not None and len(boxes) > 0:
         xyxy = boxes.xyxy.cpu().numpy()
@@ -249,16 +313,12 @@ if not st.session_state.entries:
     st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
     
     # LOKASI: Legend section (dulu Detection Settings) - tanpa slider/controls
-    st.header("📖 Legend")
+    st.header("📖 Informasi")
     st.markdown("""
     **Severity Levels:**
     - 🟢 **Light**: Kerusakan ringan (< 25% area)
     - 🟡 **Medium**: Kerusakan sedang (25-60% area)  
     - 🔴 **Heavy**: Kerusakan berat (> 60% area)
-    
-    **Detection Settings (Fixed):**
-    - Confidence Threshold: 25%
-    - Image Size: 640px
     """)
 else:
     st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
@@ -273,12 +333,7 @@ else:
         - 🟡 **Medium**: 25-60% area  
         - 🔴 **Heavy**: > 60% area
         """)
-    with col2:
-        st.markdown("""
-        **Detection Settings (Fixed):**
-        - Confidence: 25%
-        - Image Size: 640px
-        """)
+
     
     # Show summary
     total_images = sum(len(entry['files']) for entry in st.session_state.entries)
@@ -321,7 +376,7 @@ else:
                     # Load image
                     pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
                     
-                    # LOKASI: Run inference dengan fixed parameters
+                    # LOKASI: Run inference dengan fixed parameters dan custom plotting
                     overlay_pil, detections = run_inference_on_image(model, pil_img)
                     
                     # Display results
