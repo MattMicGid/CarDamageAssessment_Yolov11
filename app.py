@@ -1,14 +1,14 @@
-import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+import os
+import io
+import cv2
+import zipfile
+import tempfile
 import numpy as np
 import pandas as pd
-import io, zipfile
-import tempfile
+import streamlit as st
+from PIL import Image
 from datetime import datetime
 from pathlib import Path
-import cv2
-
-# Import YOLO - ultralytics handles OpenCV internally
 from ultralytics import YOLO
 
 # ==========================
@@ -17,235 +17,215 @@ from ultralytics import YOLO
 st.set_page_config(page_title="Car Damage Detection", layout="wide", page_icon="🚗")
 st.title("🚗 Car Damage Detection - YOLOv11")
 
-# Constants
+# ==========================
+# Constants & Auto-Start Config
+# ==========================
 WEIGHTS_FILE = "best.pt"
-# LOKASI: Fixed threshold dan image size values (tidak bisa diubah user)
-FIXED_CONF = 0.15      # Fixed confidence threshold
-FIXED_IOU = 0.7        # Fixed IOU threshold
-FIXED_IMGSZ = 640      # Fixed image size
+
+# Fixed detection params (tidak bisa diubah user)
+FIXED_CONF = 0.15
+FIXED_IOU = 0.7
+FIXED_IMGSZ = 640
 
 # Severity thresholds
-SEVERITY_T1 = 0.25  # < 25% = Light
-SEVERITY_T2 = 0.60  # 25-60% = Medium, >60% = Heavy
+SEVERITY_T1 = 0.25  # <25% = Light
+SEVERITY_T2 = 0.60  # 25–60% = Medium, >60% = Heavy
+
+# --- Real-time auto start config ---
+AUTO_START_RT = True  # True = langsung mulai begitu tab dibuka
+DEFAULT_CAMERA_SRC = os.getenv("CAMERA_SRC", "0")  # "0" = webcam default, atau set RTSP
+FALLBACK_CAMERA_SRCS = [DEFAULT_CAMERA_SRC, "0", "1"]  # fallback list
+
+# (Opsional) RTSP stabilizer via FFmpeg
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000|buffer_size;4096"
+)
 
 # ==========================
 # Utility Functions
 # ==========================
 def to_pil_rgb(arr_bgr_or_rgb):
-    """Convert ultralytics result.plot() BGR array to PIL RGB."""
+    """Convert BGR ndarray to PIL RGB."""
     if arr_bgr_or_rgb is None:
         return None
     a = arr_bgr_or_rgb
     if a.ndim == 3 and a.shape[2] == 3:
-        # Ultralytics plot() returns BGR, convert to RGB
         a = a[:, :, ::-1].copy()
     return Image.fromarray(a)
 
 def compute_severity(mask_bin: np.ndarray, xyxy: np.ndarray):
-    """Calculate severity based on mask area ratio to bbox area."""
+    """Severity = mask_area / bbox_area -> Light/Medium/Heavy."""
     x1, y1, x2, y2 = [int(v) for v in xyxy]
     bbox_area = max(1, (x2 - x1) * (y2 - y1))
     mask_area = int(mask_bin.sum())
     ratio = float(mask_area) / float(bbox_area)
-
     if ratio < SEVERITY_T1:
         severity = "Light"
     elif ratio < SEVERITY_T2:
         severity = "Medium"
     else:
         severity = "Heavy"
-
     return mask_area, bbox_area, ratio, severity
 
 def bytes_from_pil(pil_img: Image.Image, fmt="JPEG"):
-    """Convert PIL image to bytes."""
+    """PIL -> bytes."""
     buf = io.BytesIO()
     pil_img.save(buf, format=fmt)
     return buf.getvalue()
 
-# LOKASI: Custom plotting function tanpa confidence
 def plot_custom_overlay(pil_img: Image.Image, boxes, masks, names_map):
-    """Create custom overlay without confidence scores."""
+    """Overlay bbox & mask TANPA menampilkan confidence."""
     if boxes is None or len(boxes) == 0:
         return pil_img
 
-    # Convert PIL to numpy array for OpenCV
     img_array = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
     xyxy = boxes.xyxy.cpu().numpy()
     cls = boxes.cls.cpu().numpy().astype(int)
 
-    # Color map for different classes (BGR)
     colors = [
-        (0, 255, 0),    # Green
-        (255, 0, 0),    # Blue
-        (0, 0, 255),    # Red
-        (255, 255, 0),  # Cyan
-        (255, 0, 255),  # Magenta
-        (0, 255, 255),  # Yellow
+        (0, 255, 0),
+        (255, 0, 0),
+        (0, 0, 255),
+        (255, 255, 0),
+        (255, 0, 255),
+        (0, 255, 255),
     ]
 
-    # Draw masks if available
+    # masks
     if masks is not None and masks.data is not None:
         mask_data = masks.data.cpu().numpy()
         for i, mask in enumerate(mask_data):
             if i < len(cls):
-                cls_id = int(cls[i])
-                color = colors[cls_id % len(colors)]
-
-                # Create colored mask
+                color = colors[int(cls[i]) % len(colors)]
                 mask_resized = cv2.resize(mask.astype(np.uint8), (img_bgr.shape[1], img_bgr.shape[0]))
                 mask_colored = np.zeros_like(img_bgr)
                 mask_colored[:, :] = color
-
-                # Apply mask with transparency
                 alpha = 0.3
                 mask_bool = mask_resized > 0.5
                 img_bgr[mask_bool] = (1 - alpha) * img_bgr[mask_bool] + alpha * mask_colored[mask_bool]
 
-    # Draw bounding boxes and labels (without confidence)
+    # boxes + labels (tanpa conf)
     for i in range(len(xyxy)):
         x1, y1, x2, y2 = xyxy[i].astype(int)
         cls_id = int(cls[i])
         cls_name = names_map.get(cls_id, str(cls_id))
         color = colors[cls_id % len(colors)]
-
-        # Draw bounding box
         cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
 
-        # Draw label background
-        label = cls_name  # Only class name, no confidence
-        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        top_left = (x1, max(0, y1 - text_height - baseline - 5))
-        bottom_right = (x1 + text_width, y1)
+        label = cls_name
+        (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        top_left = (x1, max(0, y1 - th - bl - 5))
+        bottom_right = (x1 + tw, y1)
         cv2.rectangle(img_bgr, top_left, bottom_right, color, -1)
+        cv2.putText(img_bgr, label, (x1, y1 - bl - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-        # Draw label text
-        cv2.putText(img_bgr, label, (x1, y1 - baseline - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
-    # Convert back to RGB PIL
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(img_rgb)
-
-# LOKASI: Function untuk create human-readable summary
 def create_summary_text(plate, class_name, severity):
-    """Create human-readable summary text for Excel export."""
+    """Kalimat ringkas untuk laporan."""
     if class_name == "no_detection":
         return f"Mobil dengan nomor plat {plate} tidak terdeteksi mengalami kerusakan."
-    else:
-        return f"Mobil dengan nomor plat {plate} terdeteksi mengalami kerusakan {class_name} dengan tingkat keparahan {severity}."
+    return f"Mobil dengan nomor plat {plate} terdeteksi mengalami kerusakan {class_name} dengan tingkat keparahan {severity}."
 
 # ==========================
 # Real-Time Helpers
 # ==========================
 def open_video_capture(src):
     """
-    Open a cv2.VideoCapture from either an integer index (webcam) or RTSP/HTTP URL string.
-    Returns (cap, err_msg). If err_msg is not None, opening failed.
+    Open VideoCapture dari index (int) atau URL (rtsp/http/https).
+    Coba gunakan CAP_FFMPEG untuk URL agar lebih stabil.
     """
     try:
-        cam_index = None
-        if isinstance(src, str):
-            try:
-                cam_index = int(src)
-            except Exception:
-                cam_index = None
+        use_ffmpeg = isinstance(src, str) and (src.startswith("rtsp://") or src.startswith("http://") or src.startswith("https://"))
+        if use_ffmpeg:
+            cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        else:
+            cam_index = None
+            if isinstance(src, str):
+                try:
+                    cam_index = int(src)
+                except Exception:
+                    cam_index = None
+            cap = cv2.VideoCapture(cam_index if cam_index is not None else src)
 
-        cap = cv2.VideoCapture(cam_index if cam_index is not None else src)
         if not cap.isOpened():
-            return None, "Tidak bisa membuka sumber video. Periksa index/URL kamera."
+            return None, f"Tidak bisa membuka sumber video: {src}"
         return cap, None
     except Exception as e:
-        return None, f"Gagal membuka video: {e}"
+        return None, f"Gagal membuka video ({src}): {e}"
 
 def ensure_session_flags():
     if "rt_streaming" not in st.session_state:
         st.session_state.rt_streaming = False
     if "rt_last_frame_time" not in st.session_state:
         st.session_state.rt_last_frame_time = None
+    if "rt_src" not in st.session_state:
+        st.session_state.rt_src = DEFAULT_CAMERA_SRC
+    if "rt_auto_started" not in st.session_state:
+        st.session_state.rt_auto_started = False
 
 # ==========================
 # Model Loading
 # ==========================
 @st.cache_resource(show_spinner=True)
 def load_model_from_path():
-    """Load YOLO model from local path."""
     try:
         if Path(WEIGHTS_FILE).exists():
-            model = YOLO(WEIGHTS_FILE)
-            return model
-        else:
-            return None
+            return YOLO(WEIGHTS_FILE)
+        return None
     except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
+        st.error(f"❌ Error loading model: {e}")
         return None
 
-# ==========================
-# Check Model Availability
-# ==========================
 model = load_model_from_path()
-
 if model is None:
-    st.error("❌ **Model file not found!**")
-    st.error(f"Please ensure the model file `{WEIGHTS_FILE}` exists in the application directory.")
-    st.info("📝 **Instructions:**")
-    st.info(f"1. Place your trained YOLO model file named `{WEIGHTS_FILE}` in the same directory as this script")
-    st.info("2. Restart the application")
+    st.error("❌ **Model file tidak ditemukan!**")
+    st.info(f"Letakkan `{WEIGHTS_FILE}` di direktori aplikasi lalu restart.")
     st.stop()
+st.success(f"✅ **Model loaded:** `{WEIGHTS_FILE}`")
 
 # ==========================
-# Inference Function
+# Inference (Single Image)
 # ==========================
-# LOKASI: Function inference - dengan custom plotting tanpa confidence
 def run_inference_on_image(model, pil_img: Image.Image, conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ):
-    """Run inference on single image, return overlay and detection records."""
-
-    # Run prediction
     results = model.predict(source=pil_img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
-    r = results[0]  # Single image result
-
-    # Get custom annotated overlay (without confidence)
-    names_map = r.names  # {id: name}
+    r = results[0]
+    names_map = r.names
     boxes = getattr(r, "boxes", None)
     masks = getattr(r, "masks", None)
 
     overlay_pil = plot_custom_overlay(pil_img, boxes, masks, names_map)
 
-    # Extract detection data
     records = []
-
     if boxes is not None and len(boxes) > 0:
         xyxy = boxes.xyxy.cpu().numpy()
         cls = boxes.cls.cpu().numpy().astype(int)
         confs = boxes.conf.cpu().numpy()
 
-        # Handle masks if available
+        mask_np = None
         if masks is not None and masks.data is not None:
-            m = masks.data  # (N, H, W) float 0..1
+            m = masks.data  # (N,H,W)
             mask_np = (m.cpu().numpy() > 0.5).astype(np.uint8)
-        else:
-            mask_np = None
 
-        # Process each detection
         for i in range(len(xyxy)):
             cls_id = int(cls[i])
             cls_name = names_map.get(cls_id, str(cls_id))
             conf_i = float(confs[i])
             xyxy_i = xyxy[i]
 
-            # Calculate severity
             if mask_np is not None and i < mask_np.shape[0]:
                 mask_area, bbox_area, ratio, severity = compute_severity(mask_np[i], xyxy_i)
             else:
-                # Fallback for bbox-only models
                 bbox_area = max(1, int((xyxy_i[2]-xyxy_i[0])*(xyxy_i[3]-xyxy_i[1])))
                 mask_area, ratio, severity = 0, 0.0, "Light"
 
             records.append({
                 "class_id": cls_id,
                 "class_name": cls_name,
-                "confidence": conf_i,  # Tetap disimpan tapi tidak ditampilkan
+                "confidence": conf_i,  # disimpan, tak ditampilkan
                 "x1": int(xyxy_i[0]), "y1": int(xyxy_i[1]),
                 "x2": int(xyxy_i[2]), "y2": int(xyxy_i[3]),
                 "mask_area": int(mask_area),
@@ -257,10 +237,10 @@ def run_inference_on_image(model, pil_img: Image.Image, conf=FIXED_CONF, iou=FIX
     return overlay_pil, records
 
 # ==========================
-# Session State
+# Session State (Batch Queue)
 # ==========================
 if "entries" not in st.session_state:
-    st.session_state.entries = []  # List of {plate, files: [(name, bytes), ...]}
+    st.session_state.entries = []
 if "input_plate" not in st.session_state:
     st.session_state.input_plate = ""
 if "clear_inputs" not in st.session_state:
@@ -270,21 +250,18 @@ if "clear_inputs" not in st.session_state:
 # Sidebar - Input Only
 # ==========================
 with st.sidebar:
-    # Input section
     st.header("📝 Add Vehicle")
 
-    # Clear inputs after successful add
     if st.session_state.clear_inputs:
         st.session_state.input_plate = ""
         st.session_state.clear_inputs = False
         st.rerun()
 
-    # Plate input with Indonesian format validation
     plate = st.text_input(
         "Plate Number",
         value=st.session_state.input_plate,
         placeholder="B 1234 ABC",
-        max_chars=11,  # Max length for Indonesian plates
+        max_chars=11,
         help="Format: [A-Z] [1-4 digits] [A-Z][A-Z][A-Z]"
     )
 
@@ -292,91 +269,60 @@ with st.sidebar:
         "Upload Images",
         type=["jpg","jpeg","png"],
         accept_multiple_files=True,
-        key=f"file_uploader_{len(st.session_state.entries)}"  # Force refresh
+        key=f"file_uploader_{len(st.session_state.entries)}"
     )
 
-    add_btn = st.button("➕ Add to Queue", use_container_width=True)
-
-    # Handle add button
-    if add_btn:
+    if st.button("➕ Add to Queue", use_container_width=True):
         if not plate:
             st.warning("Masukkan nomor plat terlebih dahulu")
         elif not files:
             st.warning("Upload minimal 1 gambar")
         else:
-            # Store file bytes
             packed_files = [(f.name, f.read()) for f in files]
-            st.session_state.entries.append({
-                "plate": plate.upper().strip(),
-                "files": packed_files
-            })
+            st.session_state.entries.append({"plate": plate.upper().strip(), "files": packed_files})
             st.success(f"Ditambahkan: {plate.upper()} ({len(packed_files)} gambar)")
-
-            # Clear inputs
             st.session_state.clear_inputs = True
             st.rerun()
 
     st.divider()
-
-    # Show queue
     if st.session_state.entries:
         st.subheader("📋 Processing Queue")
-        for idx, entry in enumerate(st.session_state.entries):
+        for entry in st.session_state.entries:
             st.text(f"• {entry['plate']} — {len(entry['files'])} gambar")
-
         if st.button("🗑️ Clear Queue", use_container_width=True):
             st.session_state.entries = []
-            st.session_state.clear_inputs = True  # Also clear inputs
+            st.session_state.clear_inputs = True
             st.success("Queue dikosongkan!")
             st.rerun()
 
 # ==========================
-# Tabs: Batch Processing & Real-Time
+# Tabs
 # ==========================
 tab_batch, tab_realtime = st.tabs(["📦 Batch Processing", "🟢 Real-Time Scan"])
 
+# --------------------------
+# Batch Processing
+# --------------------------
 with tab_batch:
     if not st.session_state.entries:
-        st.info("👆 Tambahkan kendaraan pada sidebar, lalu kembali ke tab ini untuk **Process All**.")
+        st.info("👆 Tambahkan kendaraan di sidebar, lalu kembali ke tab ini untuk **Process All**.")
         st.header("📖 Informasi")
         st.markdown("""
         **Severity Levels:**
         - 🟢 **Light**: Kerusakan ringan (< 25% area)
-        - 🟡 **Medium**: Kerusakan sedang (25-60% area)  
-        - 🔴 **Heavy**: Kerusakan berat (> 60% area)
+        - 🟡 **Medium**: 25–60% area
+        - 🔴 **Heavy**: > 60% area
         """)
     else:
         st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("""
-            **Severity Levels:**
-            - 🟢 **Light**: < 25% area
-            - 🟡 **Medium**: 25-60% area  
-            - 🔴 **Heavy**: > 60% area
-            """)
-
-        # Show summary
-        total_images = sum(len(entry['files']) for entry in st.session_state.entries)
+        total_images = sum(len(e['files']) for e in st.session_state.entries)
         st.metric("Total Images to Process", total_images)
 
-        # Process All button
-        process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
-
-        if process_btn:
-            if model is None:
-                st.error("Model tidak tersedia!")
-                st.stop()
-            st.header("📊 Processing Results")
-
-            all_records = []
-            # LOKASI: List untuk summary Excel yang human-readable
-            summary_records = []
+        if st.button("🚀 Process All", type="primary", use_container_width=True):
+            all_records, summary_records = [], []
             progress_bar = st.progress(0.0)
             status_text = st.empty()
 
-            # Temporary directory for ZIP export
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp_root = Path(tmpdir)
                 orig_dir = tmp_root / "original"
@@ -384,100 +330,62 @@ with tab_batch:
                 orig_dir.mkdir(parents=True, exist_ok=True)
                 seg_dir.mkdir(parents=True, exist_ok=True)
 
-                processed_count = 0
-
-                # Process each vehicle
+                processed = 0
                 for entry in st.session_state.entries:
                     plate = entry["plate"]
                     st.subheader(f"🚗 Processing: {plate}")
 
                     for file_idx, (filename, file_bytes) in enumerate(entry["files"], 1):
-                        processed_count += 1
-                        status_text.text(f"Processing {plate} — {filename} ({processed_count}/{total_images})")
+                        processed += 1
+                        status_text.text(f"Processing {plate} — {filename} ({processed}/{total_images})")
 
-                        # Load image
                         pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-
-                        # Run inference dengan fixed parameters dan custom plotting
                         overlay_pil, detections = run_inference_on_image(model, pil_img)
 
-                        # Display results
-                        colA, colB = st.columns(2)
-                        with colA:
+                        c1, c2 = st.columns(2)
+                        with c1:
                             st.image(pil_img, caption=f"Original - {filename}", use_container_width=True)
-                        with colB:
+                        with c2:
                             st.image(overlay_pil or pil_img, caption=f"Detection - {filename}", use_container_width=True)
 
-                        # Save images for export
                         safe_plate = plate.replace(" ", "_")
                         orig_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).name}"
                         seg_name = f"{safe_plate}_{file_idx:02d}_{Path(filename).stem}_detected.jpg"
-
                         (orig_dir / orig_name).write_bytes(bytes_from_pil(pil_img, "JPEG"))
                         (seg_dir / seg_name).write_bytes(bytes_from_pil(overlay_pil or pil_img, "JPEG"))
 
-                        # Store detection records dan create summary
                         if detections:
-                            for det_idx, detection in enumerate(detections, 1):
-                                # Detailed record (original format)
-                                record = {
-                                    "plate": plate,
-                                    "image": orig_name,
-                                    "detection_id": det_idx,
-                                    **detection
-                                }
-                                all_records.append(record)
-
-                                # Human-readable summary record
-                                summary_text = create_summary_text(plate, detection["class_name"], detection["severity"])
+                            for det_idx, det in enumerate(detections, 1):
+                                all_records.append({"plate": plate, "image": orig_name, "detection_id": det_idx, **det})
                                 summary_records.append({
-                                    "plate": plate,
-                                    "image": filename,
-                                    "summary": summary_text
+                                    "plate": plate, "image": filename,
+                                    "summary": create_summary_text(plate, det["class_name"], det["severity"])
                                 })
                         else:
-                            # No detections found
                             all_records.append({
-                                "plate": plate,
-                                "image": orig_name,
-                                "detection_id": 0,
-                                "class_id": -1,
-                                "class_name": "no_detection",
-                                "confidence": 0.0,
+                                "plate": plate, "image": orig_name, "detection_id": 0,
+                                "class_id": -1, "class_name": "no_detection", "confidence": 0.0,
                                 "x1": 0, "y1": 0, "x2": 0, "y2": 0,
-                                "mask_area": 0,
-                                "bbox_area": 0,
-                                "area_ratio": 0.0,
-                                "severity": "None"
+                                "mask_area": 0, "bbox_area": 0, "area_ratio": 0.0, "severity": "None"
                             })
-
-                            # Summary untuk no detection
-                            summary_text = create_summary_text(plate, "no_detection", "None")
                             summary_records.append({
-                                "plate": plate,
-                                "image": filename,
-                                "summary": summary_text
+                                "plate": plate, "image": filename,
+                                "summary": create_summary_text(plate, "no_detection", "None")
                             })
 
-                        progress_bar.progress(processed_count / total_images)
-
+                        progress_bar.progress(processed / total_images)
                     st.divider()
 
-                # Create DataFrames - detailed dan summary
                 df_detailed = pd.DataFrame(all_records)
                 df_summary = pd.DataFrame(summary_records)
 
-                # Save both versions
                 csv_detailed_path = tmp_root / "detection_results_detailed.csv"
                 csv_summary_path = tmp_root / "detection_results_summary.csv"
                 df_detailed.to_csv(csv_detailed_path, index=False)
                 df_summary.to_csv(csv_summary_path, index=False)
 
-                # Display final results
                 st.header("📋 Final Results Summary")
                 st.success(f"✅ Processing complete! Found {len(df_detailed)} total detections.")
-
-                # Summary metrics - tanpa confidence
                 if len(df_detailed) > 0 and (df_detailed['class_id'] != -1).any():
                     damage_summary = df_detailed[df_detailed['class_id'] != -1].groupby('class_name').agg({
                         'detection_id': 'count',
@@ -485,29 +393,19 @@ with tab_batch:
                     }).rename(columns={'detection_id': 'count'})
                     st.dataframe(damage_summary, use_container_width=True)
 
-                # Display summary version (human-readable)
                 st.subheader("📄 Summary Report")
                 st.dataframe(df_summary, use_container_width=True)
 
-                # Create ZIP download
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    # Add both CSV files
                     zf.write(str(csv_detailed_path), arcname="detection_results_detailed.csv")
                     zf.write(str(csv_summary_path), arcname="detection_results_summary.csv")
-
-                    # Add images
-                    for img_path in orig_dir.rglob("*"):
-                        if img_path.is_file():
-                            zf.write(str(img_path), arcname=f"original/{img_path.name}")
-
-                    for img_path in seg_dir.rglob("*"):
-                        if img_path.is_file():
-                            zf.write(str(img_path), arcname=f"segmented/{img_path.name}")
-
+                    for p in orig_dir.rglob("*"):
+                        if p.is_file(): zf.write(str(p), arcname=f"original/{p.name}")
+                    for p in seg_dir.rglob("*"):
+                        if p.is_file(): zf.write(str(p), arcname=f"segmented/{p.name}")
                 zip_buffer.seek(0)
 
-                # Download button
                 st.download_button(
                     label="⬇️ Download Results (ZIP)",
                     data=zip_buffer,
@@ -519,51 +417,51 @@ with tab_batch:
             status_text.empty()
             progress_bar.empty()
 
+# --------------------------
+# Real-Time Scan (Auto-Start)
+# --------------------------
 with tab_realtime:
     st.header("🟢 Real-Time Scan")
-
     ensure_session_flags()
 
-    # Sumber kamera
-    col_rt1, col_rt2 = st.columns([1, 1])
-    with col_rt1:
-        src_type = st.selectbox("Sumber Kamera", ["Webcam Index", "RTSP/HTTP URL"], index=0,
-                                help="Pilih 'Webcam Index' untuk kamera internal/USB, atau 'RTSP/HTTP URL' untuk IP camera.")
-    with col_rt2:
-        frame_stride = st.slider("Frame Stride (lebih besar = lebih hemat CPU)", 1, 10, 3,
-                                 help="Infer tiap N frame. Misal 3 = proses 1 dari 3 frame.")
+    # Auto-start saat tab dibuka
+    if AUTO_START_RT and not st.session_state.rt_auto_started and not st.session_state.rt_streaming:
+        chosen = None
+        last_err = None
+        for candidate in FALLBACK_CAMERA_SRCS:
+            cap_test, err = open_video_capture(candidate)
+            if err is None:
+                st.session_state.rt_src = candidate
+                cap_test.release()
+                chosen = candidate
+                break
+            last_err = err
+        if chosen is not None:
+            st.session_state.rt_streaming = True
+            st.session_state.rt_auto_started = True
+        else:
+            st.error(last_err or "Tidak bisa membuka sumber video. Periksa index/URL kamera.")
+            st.info("Nonaktifkan AUTO_START_RT atau set env var CAMERA_SRC/DEFAULT_CAMERA_SRC yang valid.")
 
-    if src_type == "Webcam Index":
-        default_src = "0"  # kamera default
-    else:
-        default_src = "rtsp://user:pass@ip_address:554/stream1"  # contoh
+    # Info source & tombol Stop saja (Start tidak diperlukan)
+    col_info, col_btn = st.columns([3, 1])
+    with col_info:
+        st.caption(f"Source: **{st.session_state.rt_src}**  |  AUTO_START_RT: {AUTO_START_RT}")
+    with col_btn:
+        if st.button("⏹️ Stop", use_container_width=True) and st.session_state.rt_streaming:
+            st.session_state.rt_streaming = False
 
-    src_input = st.text_input("Index Webcam atau URL RTSP/HTTP", value=default_src)
-
-    # Kontrol streaming
-    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
-    start_clicked = col_btn1.button("▶️ Start", use_container_width=True)
-    stop_clicked  = col_btn2.button("⏹️ Stop", use_container_width=True)
-    status_rt = col_btn3.empty()
-
-    # Placeholder tampilan
     rt_image_placeholder = st.empty()
     rt_info_placeholder  = st.empty()
 
-    # Tindakan tombol
-    if start_clicked and not st.session_state.rt_streaming:
-        st.session_state.rt_streaming = True
-    if stop_clicked and st.session_state.rt_streaming:
-        st.session_state.rt_streaming = False
-
-    # Loop streaming
+    # Streaming loop
     if st.session_state.rt_streaming:
-        cap, err = open_video_capture(src_input)
+        cap, err = open_video_capture(st.session_state.rt_src)
         if err:
             st.error(err)
             st.session_state.rt_streaming = False
         else:
-            status_rt.success("Streaming aktif. Tekan Stop untuk berhenti.")
+            st.success("Streaming aktif. Gunakan tombol Stop untuk berhenti.")
             frame_count = 0
             prev_t = datetime.now()
 
@@ -575,44 +473,33 @@ with tab_realtime:
                     continue
 
                 frame_count += 1
+                do_infer = (frame_count % 3 == 0)  # stride default = 3 (hemat CPU)
 
-                # Hanya proses 1 dari N frame (menghemat komputasi)
-                do_infer = (frame_count % frame_stride == 0)
-
-                # Konversi -> PIL
                 pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
                 if do_infer:
-                    # Jalankan inference & overlay
-                    overlay_pil, _ = run_inference_on_image(
-                        model, pil_frame,
-                        conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ
-                    )
+                    overlay_pil, _ = run_inference_on_image(model, pil_frame,
+                                                            conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ)
                     show_pil = overlay_pil if overlay_pil is not None else pil_frame
                 else:
                     show_pil = pil_frame
 
-                # Hitung FPS kasar
                 now = datetime.now()
                 dt = (now - prev_t).total_seconds()
                 fps = (1.0 / dt) if dt > 0 else 0.0
                 prev_t = now
 
-                rt_image_placeholder.image(show_pil, caption=f"Real-Time Detection (stride={frame_stride})", use_container_width=True)
-                rt_info_placeholder.info(f"FPS ~ {fps:.1f} | Source: {src_input}")
+                rt_image_placeholder.image(show_pil, caption=f"Real-Time Detection (auto-start, stride=3)", use_container_width=True)
+                rt_info_placeholder.info(f"FPS ~ {fps:.1f} | Source: {st.session_state.rt_src}")
 
-                # Beri kesempatan UI untuk refresh, hindari loop blocking berat
                 st.experimental_sleep(0.001)
 
-            # Rilis resource saat berhenti
             try:
                 cap.release()
             except Exception:
                 pass
-
-            status_rt.warning("Streaming dihentikan.")
+            st.warning("Streaming dihentikan.")
     else:
-        status_rt.info("Siap untuk streaming. Pilih sumber kamera, lalu klik Start.")
+        st.info("Real-Time belum aktif. (AUTO_START_RT=False atau kamera belum tersedia)")
 
 # ==========================
 # Footer
