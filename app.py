@@ -19,7 +19,7 @@ st.title("🚗 Car Damage Detection - YOLOv11")
 # Constants
 WEIGHTS_FILE = "best.pt"
 # LOKASI: Fixed threshold dan image size values (tidak bisa diubah user)
-FIXED_CONF = 0.15      # Fixed confidence threshold
+FIXED_CONF = 0.25      # Fixed confidence threshold
 FIXED_IOU = 0.7        # Fixed IOU threshold  
 FIXED_IMGSZ = 640      # Fixed image size
 
@@ -249,12 +249,16 @@ if not st.session_state.entries:
     st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
     
     # LOKASI: Legend section (dulu Detection Settings) - tanpa slider/controls
-    st.header("📖 Informasi")
+    st.header("📖 Legend")
     st.markdown("""
     **Severity Levels:**
     - 🟢 **Light**: Kerusakan ringan (< 25% area)
     - 🟡 **Medium**: Kerusakan sedang (25-60% area)  
     - 🔴 **Heavy**: Kerusakan berat (> 60% area)
+    
+    **Detection Settings (Fixed):**
+    - Confidence Threshold: 25%
+    - Image Size: 640px
     """)
 else:
     st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
@@ -269,7 +273,12 @@ else:
         - 🟡 **Medium**: 25-60% area  
         - 🔴 **Heavy**: > 60% area
         """)
-
+    with col2:
+        st.markdown("""
+        **Detection Settings (Fixed):**
+        - Confidence: 25%
+        - Image Size: 640px
+        """)
     
     # Show summary
     total_images = sum(len(entry['files']) for entry in st.session_state.entries)
