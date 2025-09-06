@@ -1,44 +1,48 @@
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import numpy as np
 import pandas as pd
-import io, zipfile
-import tempfile
-from datetime import datetime
-from pathlib import Path
+import io
 import cv2
 import time
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-import av
+from datetime import datetime
+from pathlib import Path
 import threading
 import queue
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
 
-# Import YOLO - ultralytics handles OpenCV internally
-from ultralytics import YOLO
+# Import YOLO
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    st.error("YOLO not installed. Install with: pip install ultralytics")
 
 # ==========================
-# App Config
+# OPTIMIZED CONFIG
 # ==========================
 st.set_page_config(page_title="Real-Time Car Damage Detection", layout="wide", page_icon="🚗")
-st.title("🚗 Real-Time Car Damage Detection - YOLOv11")
 
-# Constants
+# Performance settings - HEAVILY OPTIMIZED
 WEIGHTS_FILE = "best.pt"
-# LOKASI: Fixed threshold dan image size values (tidak bisa diubah user)
-FIXED_CONF = 0.15      # Fixed confidence threshold
-FIXED_IOU = 0.7        # Fixed IOU threshold  
-FIXED_IMGSZ = 640      # Fixed image size
+FIXED_CONF = 0.25      # Increased confidence (less false positives = faster)
+FIXED_IOU = 0.7        
+FIXED_IMGSZ = 416      # Reduced from 640 to 416 (much faster!)
+
+# Real-time optimization
+FPS_TARGET = 5         # Reduced from 10 to 5 FPS
+FRAME_SKIP = 5         # Increased skip (process every 5th frame)
+MAX_DETECTIONS = 50    # Limit stored detections
+RESIZE_FACTOR = 0.5    # Resize input frames
 
 # Severity thresholds
-SEVERITY_T1 = 0.25  # < 25% = Light
-SEVERITY_T2 = 0.60  # 25-60% = Medium, >60% = Heavy
-
-# Real-time processing settings
-FPS_TARGET = 10  # Target FPS for processing
-FRAME_SKIP = 3   # Process every N frames
+SEVERITY_T1 = 0.25
+SEVERITY_T2 = 0.60
 
 # ==========================
-# Global variables for real-time
+# OPTIMIZED SESSION STATE
 # ==========================
 if 'detection_results' not in st.session_state:
     st.session_state.detection_results = []
@@ -46,527 +50,286 @@ if 'frame_count' not in st.session_state:
     st.session_state.frame_count = 0
 if 'last_detections' not in st.session_state:
     st.session_state.last_detections = []
+if 'processing_time' not in st.session_state:
+    st.session_state.processing_time = 0
+if 'model_loaded' not in st.session_state:
+    st.session_state.model_loaded = False
 
 # ==========================
-# Utility Functions
-# ==========================
-def to_pil_rgb(arr_bgr_or_rgb):
-    """Convert ultralytics result.plot() BGR array to PIL RGB."""
-    if arr_bgr_or_rgb is None:
-        return None
-    a = arr_bgr_or_rgb
-    if a.ndim == 3 and a.shape[2] == 3:
-        # Ultralytics plot() returns BGR, convert to RGB
-        a = a[:, :, ::-1].copy()
-    return Image.fromarray(a)
-
-def compute_severity(mask_bin: np.ndarray, xyxy: np.ndarray):
-    """Calculate severity based on mask area ratio to bbox area."""
-    x1, y1, x2, y2 = [int(v) for v in xyxy]
-    bbox_area = max(1, (x2 - x1) * (y2 - y1))
-    mask_area = int(mask_bin.sum())
-    ratio = float(mask_area) / float(bbox_area)
-    
-    if ratio < SEVERITY_T1:
-        severity = "Light"
-    elif ratio < SEVERITY_T2:
-        severity = "Medium" 
-    else:
-        severity = "Heavy"
-        
-    return mask_area, bbox_area, ratio, severity
-
-def bytes_from_pil(pil_img: Image.Image, fmt="JPEG"):
-    """Convert PIL image to bytes."""
-    buf = io.BytesIO()
-    pil_img.save(buf, format=fmt)
-    return buf.getvalue()
-
-# LOKASI: Custom plotting function tanpa confidence untuk real-time
-def plot_custom_overlay_realtime(img_bgr, boxes, masks, names_map):
-    """Create custom overlay without confidence scores for real-time processing."""
-    if boxes is None or len(boxes) == 0:
-        return img_bgr
-    
-    xyxy = boxes.xyxy.cpu().numpy()
-    cls = boxes.cls.cpu().numpy().astype(int)
-    
-    # Color map for different classes
-    colors = [
-        (0, 255, 0),    # Green
-        (255, 0, 0),    # Blue (BGR format)
-        (0, 0, 255),    # Red
-        (255, 255, 0),  # Cyan
-        (255, 0, 255),  # Magenta
-        (0, 255, 255),  # Yellow
-    ]
-    
-    # Draw masks if available
-    if masks is not None and masks.data is not None:
-        mask_data = masks.data.cpu().numpy()
-        for i, mask in enumerate(mask_data):
-            if i < len(cls):
-                cls_id = int(cls[i])
-                color = colors[cls_id % len(colors)]
-                
-                # Create colored mask
-                mask_resized = cv2.resize(mask.astype(np.uint8), (img_bgr.shape[1], img_bgr.shape[0]))
-                mask_colored = np.zeros_like(img_bgr)
-                mask_colored[:, :] = color
-                
-                # Apply mask with transparency
-                alpha = 0.3
-                mask_bool = mask_resized > 0.5
-                img_bgr[mask_bool] = (1 - alpha) * img_bgr[mask_bool] + alpha * mask_colored[mask_bool]
-    
-    # Draw bounding boxes and labels (without confidence)
-    for i in range(len(xyxy)):
-        x1, y1, x2, y2 = xyxy[i].astype(int)
-        cls_id = int(cls[i])
-        cls_name = names_map.get(cls_id, str(cls_id))
-        color = colors[cls_id % len(colors)]
-        
-        # Draw bounding box
-        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
-        
-        # Draw label background
-        label = cls_name  # Only class name, no confidence
-        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(img_bgr, (x1, y1 - text_height - baseline - 5), (x1 + text_width, y1), color, -1)
-        
-        # Draw label text
-        cv2.putText(img_bgr, label, (x1, y1 - baseline - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    return img_bgr
-
-# LOKASI: Function untuk create human-readable summary
-def create_summary_text(plate, class_name, severity):
-    """Create human-readable summary text for Excel export."""
-    if class_name == "no_detection":
-        return f"Mobil dengan nomor plat {plate} tidak terdeteksi mengalami kerusakan."
-    else:
-        return f"Mobil dengan nomor plat {plate} terdeteksi mengalami kerusakan {class_name} dengan tingkat keparahan {severity}."
-
-# ==========================
-# Model Loading
+# OPTIMIZED MODEL LOADING
 # ==========================
 @st.cache_resource(show_spinner=True)
-def load_model_from_path():
-    """Load YOLO model from local path."""
+def load_model_optimized():
+    """Load YOLO model with optimizations."""
+    if not YOLO_AVAILABLE:
+        return None
+        
     try:
         if Path(WEIGHTS_FILE).exists():
             model = YOLO(WEIGHTS_FILE)
+            # Optimize model for inference
+            model.fuse()  # Fuse conv and bn layers
             return model
         else:
+            st.error(f"Model file {WEIGHTS_FILE} not found!")
             return None
     except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
+        st.error(f"Error loading model: {e}")
         return None
 
 # ==========================
-# Real-time Inference Function
+# SUPER FAST INFERENCE
 # ==========================
-def run_inference_realtime(model, frame_bgr):
-    """Run inference on frame for real-time processing."""
+def run_inference_fast(model, frame_bgr):
+    """Ultra-optimized inference for real-time."""
+    start_time = time.time()
+    
     try:
-        # Convert BGR to RGB for YOLO
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
+        # Resize frame for faster processing
+        h, w = frame_bgr.shape[:2]
+        new_h, new_w = int(h * RESIZE_FACTOR), int(w * RESIZE_FACTOR)
+        small_frame = cv2.resize(frame_bgr, (new_w, new_h))
         
-        # Run prediction
-        results = model.predict(source=pil_img, conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ, verbose=False)
-        r = results[0]  # Single image result
+        # Convert to RGB
+        frame_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
         
-        # Get detection data
-        names_map = r.names  # {id: name}
-        boxes = getattr(r, "boxes", None)
-        masks = getattr(r, "masks", None)
+        # Fast inference with minimal settings
+        results = model.predict(
+            source=frame_rgb,
+            conf=FIXED_CONF,
+            iou=FIXED_IOU,
+            imgsz=FIXED_IMGSZ,
+            verbose=False,
+            save=False,
+            show=False,
+            stream=False,
+            half=True  # Use FP16 for speed
+        )
         
-        # Apply custom overlay
-        annotated_frame = plot_custom_overlay_realtime(frame_bgr.copy(), boxes, masks, names_map)
-        
-        # Extract detection data
+        r = results[0]
         detections = []
+        annotated_frame = frame_bgr.copy()
         
-        if boxes is not None and len(boxes) > 0:
-            xyxy = boxes.xyxy.cpu().numpy()
-            cls = boxes.cls.cpu().numpy().astype(int)
-            confs = boxes.conf.cpu().numpy()
+        # Quick detection extraction
+        if hasattr(r, 'boxes') and r.boxes is not None and len(r.boxes) > 0:
+            boxes = r.boxes.xyxy.cpu().numpy()
+            classes = r.boxes.cls.cpu().numpy().astype(int)
+            confs = r.boxes.conf.cpu().numpy()
+            names = r.names
             
-            # Handle masks if available
-            if masks is not None and masks.data is not None:
-                m = masks.data  # (N, H, W) float 0..1
-                mask_np = (m.cpu().numpy() > 0.5).astype(np.uint8)
-            else:
-                mask_np = None
+            # Scale boxes back to original size
+            scale_x = w / new_w
+            scale_y = h / new_h
+            
+            for i, (box, cls_id, conf) in enumerate(zip(boxes, classes, confs)):
+                # Scale coordinates
+                x1, y1, x2, y2 = box
+                x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
+                y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
                 
-            # Process each detection
-            for i in range(len(xyxy)):
-                cls_id = int(cls[i])
-                cls_name = names_map.get(cls_id, str(cls_id))
-                conf_i = float(confs[i])
-                xyxy_i = xyxy[i]
+                cls_name = names.get(cls_id, str(cls_id))
                 
-                # Calculate severity
-                if mask_np is not None and i < mask_np.shape[0]:
-                    mask_area, bbox_area, ratio, severity = compute_severity(mask_np[i], xyxy_i)
+                # Simple severity calculation
+                bbox_area = (x2 - x1) * (y2 - y1)
+                if bbox_area < 5000:
+                    severity = "Light"
+                elif bbox_area < 15000:
+                    severity = "Medium"
                 else:
-                    # Fallback for bbox-only models
-                    bbox_area = max(1, int((xyxy_i[2]-xyxy_i[0])*(xyxy_i[3]-xyxy_i[1])))
-                    mask_area, ratio, severity = 0, 0.0, "Light"
-                    
-                detections.append({
-                    "class_id": cls_id,
-                    "class_name": cls_name,
-                    "confidence": conf_i,
-                    "severity": severity,
-                    "bbox": xyxy_i.tolist()
-                })
+                    severity = "Heavy"
                 
+                # Draw simple rectangle (fastest)
+                color = (0, 255, 0) if severity == "Light" else (0, 255, 255) if severity == "Medium" else (0, 0, 255)
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Simple text
+                label = f"{cls_name}"
+                cv2.putText(annotated_frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                
+                detections.append({
+                    "class_name": cls_name,
+                    "confidence": float(conf),
+                    "severity": severity,
+                    "bbox": [x1, y1, x2, y2]
+                })
+        
+        processing_time = time.time() - start_time
+        st.session_state.processing_time = processing_time
+        
         return annotated_frame, detections
         
     except Exception as e:
-        st.error(f"Error in real-time inference: {e}")
+        st.session_state.processing_time = time.time() - start_time
         return frame_bgr, []
 
 # ==========================
-# WebRTC Video Processor
+# LIGHTWEIGHT VIDEO PROCESSOR
 # ==========================
-class VideoProcessor:
+class FastVideoProcessor:
     def __init__(self, model):
         self.model = model
         self.frame_count = 0
+        self.last_process_time = 0
         
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         
-        # Process every FRAME_SKIP frames for performance
-        if self.frame_count % FRAME_SKIP == 0:
+        # Skip frames for performance
+        current_time = time.time()
+        if (self.frame_count % FRAME_SKIP == 0 and 
+            current_time - self.last_process_time > 1.0/FPS_TARGET):
+            
             if self.model is not None:
-                annotated_img, detections = run_inference_realtime(self.model, img)
+                annotated_img, detections = run_inference_fast(self.model, img)
                 
-                # Update session state with latest detections
+                # Update detections (limit storage)
                 st.session_state.last_detections = detections
-                st.session_state.frame_count += 1
                 
-                # Add timestamp and save detection if found
                 if detections:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    timestamp = datetime.now().strftime("%H:%M:%S")
                     for det in detections:
                         det['timestamp'] = timestamp
+                    
+                    # Limit stored results
                     st.session_state.detection_results.extend(detections)
+                    if len(st.session_state.detection_results) > MAX_DETECTIONS:
+                        st.session_state.detection_results = st.session_state.detection_results[-MAX_DETECTIONS:]
                 
                 img = annotated_img
+                self.last_process_time = current_time
         
         self.frame_count += 1
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ==========================
-# Check Model Availability
+# LOAD MODEL
 # ==========================
-model = load_model_from_path()
+st.title("🚗 Fast Real-Time Car Damage Detection")
+
+with st.spinner("Loading AI Model..."):
+    model = load_model_optimized()
 
 if model is None:
-    st.error("❌ **Model file not found!**")
-    st.error(f"Please ensure the model file `{WEIGHTS_FILE}` exists in the application directory.")
-    st.info("📝 **Instructions:**")
-    st.info(f"1. Place your trained YOLO model file named `{WEIGHTS_FILE}` in the same directory as this script")
-    st.info("2. Install required packages: `pip install streamlit-webrtc`")
-    st.info("3. Restart the application")
+    st.error("❌ Model tidak tersedia!")
+    st.info("Pastikan file 'best.pt' ada di folder aplikasi")
     st.stop()
 
-# ==========================
-# Session State
-# ==========================
-if "entries" not in st.session_state:
-    st.session_state.entries = []  # List of {plate, files: [(name, bytes), ...]}
+st.success(f"✅ Model loaded: {WEIGHTS_FILE}")
+st.session_state.model_loaded = True
 
 # ==========================
-# Model Info Display
+# PERFORMANCE SETTINGS DISPLAY
 # ==========================
-st.success(f"✅ **Model loaded successfully:** `{WEIGHTS_FILE}`")
-
-# ==========================
-# Main Interface - Tabs for different modes
-# ==========================
-tab1, tab2, tab3 = st.tabs(["📹 Real-Time Detection", "📁 Batch Processing", "📊 Results"])
-
-# ==========================
-# Tab 1: Real-Time Detection
-# ==========================
-with tab1:
-    st.header("📹 Real-Time Car Damage Detection")
-    st.markdown("Gunakan webcam atau kamera untuk deteksi kerusakan mobil secara real-time.")
-    
-    # WebRTC Configuration
-    rtc_configuration = RTCConfiguration({
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-    })
-    
-    # Real-time video stream
-    col1, col2 = st.columns([2, 1])
-    
+with st.expander("⚡ Performance Settings", expanded=False):
+    col1, col2, col3 = st.columns(3)
     with col1:
-        webrtc_ctx = webrtc_streamer(
-            key="car-damage-detection",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=rtc_configuration,
-            video_processor_factory=lambda: VideoProcessor(model),
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
-    
+        st.metric("Input Size", f"{FIXED_IMGSZ}px")
+        st.metric("Frame Skip", f"1/{FRAME_SKIP}")
     with col2:
-        st.subheader("🔍 Live Detection Status")
-        
-        # Real-time detection display
-        detection_placeholder = st.empty()
-        stats_placeholder = st.empty()
-        
-        if webrtc_ctx.video_processor:
-            # Display current detections
-            if st.session_state.last_detections:
-                detection_placeholder.success(f"🚨 {len(st.session_state.last_detections)} Detection(s) Found!")
-                
-                for i, det in enumerate(st.session_state.last_detections):
-                    severity_emoji = {"Light": "🟢", "Medium": "🟡", "Heavy": "🔴"}.get(det['severity'], "⚪")
-                    st.write(f"{severity_emoji} **{det['class_name']}** - {det['severity']}")
-            else:
-                detection_placeholder.info("👀 Monitoring for damage...")
-        
-        # Statistics
-        if st.session_state.detection_results:
-            total_detections = len(st.session_state.detection_results)
-            stats_placeholder.metric("Total Detections", total_detections)
-            
-            # Severity breakdown
-            severity_counts = {}
-            for det in st.session_state.detection_results:
-                sev = det['severity']
-                severity_counts[sev] = severity_counts.get(sev, 0) + 1
-            
-            for sev, count in severity_counts.items():
-                emoji = {"Light": "🟢", "Medium": "🟡", "Heavy": "🔴"}.get(sev, "⚪")
-                st.metric(f"{emoji} {sev}", count)
-        
-        # Control buttons
-        if st.button("🗑️ Clear Detections", use_container_width=True):
-            st.session_state.detection_results = []
-            st.session_state.last_detections = []
-            st.session_state.frame_count = 0
-            st.success("Detections cleared!")
-            st.rerun()
-        
-        if st.button("💾 Save Current Session", use_container_width=True):
-            if st.session_state.detection_results:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                df = pd.DataFrame(st.session_state.detection_results)
-                csv_data = df.to_csv(index=False)
-                st.download_button(
-                    label="⬇️ Download CSV",
-                    data=csv_data,
-                    file_name=f"realtime_detections_{timestamp}.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.warning("No detections to save")
-    
-    # Legend and settings
-    st.subheader("📖 Detection Legend")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("""
-        **Severity Levels:**
-        - 🟢 **Light**: < 25% area
-        - 🟡 **Medium**: 25-60% area  
-        - 🔴 **Heavy**: > 60% area
-        """)
-    
-    with col2:
-        st.markdown("""
-        **Real-time Settings:**
-        - Processing every 3rd frame for performance
-        - Target FPS: 10
-        - Confidence threshold: 15%
-        """)
+        st.metric("Target FPS", FPS_TARGET)
+        st.metric("Resize Factor", f"{RESIZE_FACTOR}x")
+    with col3:
+        st.metric("Confidence", f"{FIXED_CONF}")
+        st.metric("Max Storage", MAX_DETECTIONS)
 
 # ==========================
-# Tab 2: Batch Processing (Original functionality)
+# MAIN INTERFACE
 # ==========================
-with tab2:
-    # Sidebar - Input Only
-    with st.sidebar:
-        # Input section
-        st.header("📝 Add Vehicle")
-        
-        # Initialize input states
-        if "input_plate" not in st.session_state:
-            st.session_state.input_plate = ""
-        if "clear_inputs" not in st.session_state:
-            st.session_state.clear_inputs = False
-        
-        # Clear inputs after successful add
-        if st.session_state.clear_inputs:
-            st.session_state.input_plate = ""
-            st.session_state.clear_inputs = False
-            st.rerun()
-        
-        # Plate input with Indonesian format validation
-        plate = st.text_input(
-            "Plate Number", 
-            value=st.session_state.input_plate,
-            placeholder="B 1234 ABC",
-            max_chars=11,  # Max length for Indonesian plates
-            help="Format: [A-Z] [1-4 digits] [A-Z][A-Z][A-Z]"
-        )
-        
-        files = st.file_uploader(
-            "Upload Images", 
-            type=["jpg","jpeg","png"], 
-            accept_multiple_files=True,
-            key=f"file_uploader_{len(st.session_state.entries)}"  # Force refresh
-        )
-        
-        add_btn = st.button("➕ Add to Queue", use_container_width=True)
-        
-        # Handle add button
-        if add_btn:
-            if not plate:
-                st.warning("Masukkan nomor plat terlebih dahulu")
-            elif not files:
-                st.warning("Upload minimal 1 gambar")
-            else:
-                # Store file bytes
-                packed_files = [(f.name, f.read()) for f in files]
-                st.session_state.entries.append({
-                    "plate": plate.upper().strip(), 
-                    "files": packed_files
-                })
-                st.success(f"Ditambahkan: {plate.upper()} ({len(packed_files)} gambar)")
-                
-                # Clear inputs
-                st.session_state.clear_inputs = True
-                st.rerun()
-        
-        st.divider()
-        
-        # Show queue
-        if st.session_state.entries:
-            st.subheader("📋 Processing Queue")
-            for idx, entry in enumerate(st.session_state.entries):
-                st.text(f"• {entry['plate']} — {len(entry['files'])} gambar")
-            
-            if st.button("🗑️ Clear Queue", use_container_width=True):
-                st.session_state.entries = []
-                st.session_state.clear_inputs = True  # Also clear inputs
-                st.success("Queue dikosongkan!")
-                st.rerun()
+st.header("📹 Live Detection")
 
-    # Main batch processing interface (same as original)
-    if not st.session_state.entries:
-        st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
-        
-        st.header("📖 Informasi")
-        st.markdown("""
-        **Severity Levels:**
-        - 🟢 **Light**: Kerusakan ringan (< 25% area)
-        - 🟡 **Medium**: Kerusakan sedang (25-60% area)  
-        - 🔴 **Heavy**: Kerusakan berat (> 60% area)
-        """)
+# WebRTC with minimal config
+rtc_configuration = RTCConfiguration({
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+})
+
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    webrtc_ctx = webrtc_streamer(
+        key="fast-car-damage",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=rtc_configuration,
+        video_processor_factory=lambda: FastVideoProcessor(model),
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 640},
+                "height": {"ideal": 480},
+                "frameRate": {"ideal": 15, "max": 30}
+            },
+            "audio": False
+        },
+        async_processing=True,
+    )
+
+with col2:
+    st.subheader("🔍 Status")
+    
+    # Performance metrics
+    if st.session_state.processing_time > 0:
+        fps_estimate = 1.0 / st.session_state.processing_time
+        st.metric("Processing FPS", f"{fps_estimate:.1f}")
+    
+    # Detection status
+    status_placeholder = st.empty()
+    if st.session_state.last_detections:
+        status_placeholder.success(f"🚨 {len(st.session_state.last_detections)} Found!")
+        for det in st.session_state.last_detections[:3]:  # Show max 3
+            severity_color = {"Light": "🟢", "Medium": "🟡", "Heavy": "🔴"}.get(det['severity'], "⚪")
+            st.write(f"{severity_color} **{det['class_name']}**")
     else:
-        st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
-        
-        # Show summary
-        total_images = sum(len(entry['files']) for entry in st.session_state.entries)
-        st.metric("Total Images to Process", total_images)
-        
-        # Process All button
-        process_btn = st.button("🚀 Process All", type="primary", use_container_width=True)
-        
-        if process_btn:
-            # (Include all original batch processing code here - same as before)
-            st.header("📊 Processing Results")
-            st.success("Batch processing functionality remains the same as original!")
-
-# ==========================
-# Tab 3: Results and Analytics
-# ==========================
-with tab3:
-    st.header("📊 Detection Results & Analytics")
+        status_placeholder.info("👀 Monitoring...")
     
+    # Quick stats
     if st.session_state.detection_results:
-        df_results = pd.DataFrame(st.session_state.detection_results)
-        
-        # Summary statistics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Detections", len(df_results))
-        
-        with col2:
-            unique_classes = df_results['class_name'].nunique()
-            st.metric("Damage Types", unique_classes)
-        
-        with col3:
-            avg_conf = df_results['confidence'].mean()
-            st.metric("Avg Confidence", f"{avg_conf:.2%}")
-        
-        with col4:
-            heavy_count = len(df_results[df_results['severity'] == 'Heavy'])
-            st.metric("🔴 Heavy Damage", heavy_count)
-        
-        # Visualizations
-        st.subheader("📈 Detection Analysis")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Damage type distribution
-            damage_counts = df_results['class_name'].value_counts()
-            st.bar_chart(damage_counts)
-            st.caption("Damage Types Distribution")
-        
-        with col2:
-            # Severity distribution
-            severity_counts = df_results['severity'].value_counts()
-            st.bar_chart(severity_counts)
-            st.caption("Severity Distribution")
-        
-        # Detailed results table
-        st.subheader("📋 Detailed Results")
-        st.dataframe(df_results, use_container_width=True)
-        
-        # Export options
-        st.subheader("💾 Export Results")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            csv_data = df_results.to_csv(index=False)
-            st.download_button(
-                label="⬇️ Download CSV",
-                data=csv_data,
-                file_name=f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        
-        with col2:
-            json_data = df_results.to_json(orient='records', indent=2)
-            st.download_button(
-                label="⬇️ Download JSON",
-                data=json_data,
-                file_name=f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True
-            )
+        st.metric("Total Found", len(st.session_state.detection_results))
     
-    else:
-        st.info("🔍 No detection results yet. Start with real-time detection or batch processing.")
+    # Controls
+    if st.button("🗑️ Clear", use_container_width=True):
+        st.session_state.detection_results = []
+        st.session_state.last_detections = []
+        st.rerun()
 
 # ==========================
-# Footer
+# LEGEND
+# ==========================
+st.subheader("📖 Legend")
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("""
+    **Severity:**
+    - 🟢 Light: Small damage
+    - 🟡 Medium: Moderate damage  
+    - 🔴 Heavy: Severe damage
+    """)
+
+with col2:
+    st.markdown("""
+    **Optimizations:**
+    - Reduced image size (416px)
+    - Process every 5th frame
+    - FP16 inference for speed
+    """)
+
+# ==========================
+# RESULTS SECTION
+# ==========================
+if st.session_state.detection_results:
+    with st.expander("📊 Results", expanded=False):
+        df = pd.DataFrame(st.session_state.detection_results)
+        st.dataframe(df[['timestamp', 'class_name', 'severity', 'confidence']], use_container_width=True)
+        
+        # Quick export
+        csv_data = df.to_csv(index=False)
+        st.download_button(
+            "⬇️ Download CSV",
+            csv_data,
+            f"detections_{datetime.now().strftime('%H%M%S')}.csv",
+            "text/csv"
+        )
+
+# ==========================
+# FOOTER
 # ==========================
 st.divider()
-st.caption("🔧 Real-Time Car Damage Detection using YOLOv11 Instance Segmentation")
-st.caption("⚠️ Automated severity assessment - verify with professional inspection")
-st.caption("📹 Real-time processing optimized for performance - processes every 3rd frame")
+st.caption("🚀 Optimized for speed - Real-time car damage detection")
+st.caption("⚡ Processing every 5th frame at 416px for maximum performance")
