@@ -249,16 +249,12 @@ if not st.session_state.entries:
     st.info("👆 Add vehicles to the queue using the sidebar, then click **Process All** below.")
     
     # LOKASI: Legend section (dulu Detection Settings) - tanpa slider/controls
-    st.header("📖 Legend")
+    st.header("📖 Informasi")
     st.markdown("""
     **Severity Levels:**
     - 🟢 **Light**: Kerusakan ringan (< 25% area)
     - 🟡 **Medium**: Kerusakan sedang (25-60% area)  
     - 🔴 **Heavy**: Kerusakan berat (> 60% area)
-    
-    **Detection Settings (Fixed):**
-    - Confidence Threshold: 25%
-    - Image Size: 640px
     """)
 else:
     st.header(f"🚀 Ready to Process {len(st.session_state.entries)} Vehicle(s)")
