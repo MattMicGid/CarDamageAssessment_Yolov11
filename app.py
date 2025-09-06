@@ -18,11 +18,9 @@ st.set_page_config(page_title="Car Damage Detection", layout="wide", page_icon="
 st.title("🚗 Car Damage Detection - YOLOv11")
 
 # ==========================
-# Constants & Auto-Start Config
+# Constants (Fixed params)
 # ==========================
 WEIGHTS_FILE = "best.pt"
-
-# Fixed detection params (tidak bisa diubah user)
 FIXED_CONF = 0.15
 FIXED_IOU = 0.7
 FIXED_IMGSZ = 640
@@ -31,12 +29,14 @@ FIXED_IMGSZ = 640
 SEVERITY_T1 = 0.25  # <25% = Light
 SEVERITY_T2 = 0.60  # 25–60% = Medium, >60% = Heavy
 
-# --- Real-time auto start config ---
-AUTO_START_RT = True  # True = langsung mulai begitu tab dibuka
-DEFAULT_CAMERA_SRC = os.getenv("CAMERA_SRC", "0")  # "0" = webcam default, atau set RTSP
-FALLBACK_CAMERA_SRCS = [DEFAULT_CAMERA_SRC, "0", "1"]  # fallback list
+# ==========================
+# Real-time auto-start (HARD-CODED CAMERA INDEX 0)
+# ==========================
+AUTO_START_RT = True
+DEFAULT_CAMERA_SRC = "0"        # hanya pakai webcam index 0
+FALLBACK_CAMERA_SRCS = ["0"]    # tidak ada fallback lain
 
-# (Opsional) RTSP stabilizer via FFmpeg
+# (opsional) set opsi FFmpeg agar stabil bila kelak pakai RTSP
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp|stimeout;5000000|buffer_size;4096"
@@ -46,7 +46,6 @@ os.environ.setdefault(
 # Utility Functions
 # ==========================
 def to_pil_rgb(arr_bgr_or_rgb):
-    """Convert BGR ndarray to PIL RGB."""
     if arr_bgr_or_rgb is None:
         return None
     a = arr_bgr_or_rgb
@@ -55,7 +54,6 @@ def to_pil_rgb(arr_bgr_or_rgb):
     return Image.fromarray(a)
 
 def compute_severity(mask_bin: np.ndarray, xyxy: np.ndarray):
-    """Severity = mask_area / bbox_area -> Light/Medium/Heavy."""
     x1, y1, x2, y2 = [int(v) for v in xyxy]
     bbox_area = max(1, (x2 - x1) * (y2 - y1))
     mask_area = int(mask_bin.sum())
@@ -69,16 +67,13 @@ def compute_severity(mask_bin: np.ndarray, xyxy: np.ndarray):
     return mask_area, bbox_area, ratio, severity
 
 def bytes_from_pil(pil_img: Image.Image, fmt="JPEG"):
-    """PIL -> bytes."""
     buf = io.BytesIO()
     pil_img.save(buf, format=fmt)
     return buf.getvalue()
 
 def plot_custom_overlay(pil_img: Image.Image, boxes, masks, names_map):
-    """Overlay bbox & mask TANPA menampilkan confidence."""
     if boxes is None or len(boxes) == 0:
         return pil_img
-
     img_array = np.array(pil_img)
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
@@ -86,12 +81,8 @@ def plot_custom_overlay(pil_img: Image.Image, boxes, masks, names_map):
     cls = boxes.cls.cpu().numpy().astype(int)
 
     colors = [
-        (0, 255, 0),
-        (255, 0, 0),
-        (0, 0, 255),
-        (255, 255, 0),
-        (255, 0, 255),
-        (0, 255, 255),
+        (0, 255, 0), (255, 0, 0), (0, 0, 255),
+        (255, 255, 0), (255, 0, 255), (0, 255, 255)
     ]
 
     # masks
@@ -101,31 +92,26 @@ def plot_custom_overlay(pil_img: Image.Image, boxes, masks, names_map):
             if i < len(cls):
                 color = colors[int(cls[i]) % len(colors)]
                 mask_resized = cv2.resize(mask.astype(np.uint8), (img_bgr.shape[1], img_bgr.shape[0]))
-                mask_colored = np.zeros_like(img_bgr)
-                mask_colored[:, :] = color
+                mask_colored = np.zeros_like(img_bgr); mask_colored[:, :] = color
                 alpha = 0.3
                 mask_bool = mask_resized > 0.5
                 img_bgr[mask_bool] = (1 - alpha) * img_bgr[mask_bool] + alpha * mask_colored[mask_bool]
 
-    # boxes + labels (tanpa conf)
+    # boxes + label (tanpa conf)
     for i in range(len(xyxy)):
         x1, y1, x2, y2 = xyxy[i].astype(int)
-        cls_id = int(cls[i])
-        cls_name = names_map.get(cls_id, str(cls_id))
+        cls_id = int(cls[i]); cls_name = names_map.get(cls_id, str(cls_id))
         color = colors[cls_id % len(colors)]
         cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
-
         label = cls_name
         (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        top_left = (x1, max(0, y1 - th - bl - 5))
-        bottom_right = (x1 + tw, y1)
+        top_left = (x1, max(0, y1 - th - bl - 5)); bottom_right = (x1 + tw, y1)
         cv2.rectangle(img_bgr, top_left, bottom_right, color, -1)
         cv2.putText(img_bgr, label, (x1, y1 - bl - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
     return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
 def create_summary_text(plate, class_name, severity):
-    """Kalimat ringkas untuk laporan."""
     if class_name == "no_detection":
         return f"Mobil dengan nomor plat {plate} tidak terdeteksi mengalami kerusakan."
     return f"Mobil dengan nomor plat {plate} terdeteksi mengalami kerusakan {class_name} dengan tingkat keparahan {severity}."
@@ -134,10 +120,6 @@ def create_summary_text(plate, class_name, severity):
 # Real-Time Helpers
 # ==========================
 def open_video_capture(src):
-    """
-    Open VideoCapture dari index (int) atau URL (rtsp/http/https).
-    Coba gunakan CAP_FFMPEG untuk URL agar lebih stabil.
-    """
     try:
         use_ffmpeg = isinstance(src, str) and (src.startswith("rtsp://") or src.startswith("http://") or src.startswith("https://"))
         if use_ffmpeg:
@@ -145,12 +127,9 @@ def open_video_capture(src):
         else:
             cam_index = None
             if isinstance(src, str):
-                try:
-                    cam_index = int(src)
-                except Exception:
-                    cam_index = None
+                try: cam_index = int(src)
+                except Exception: cam_index = None
             cap = cv2.VideoCapture(cam_index if cam_index is not None else src)
-
         if not cap.isOpened():
             return None, f"Tidak bisa membuka sumber video: {src}"
         return cap, None
@@ -204,36 +183,25 @@ def run_inference_on_image(model, pil_img: Image.Image, conf=FIXED_CONF, iou=FIX
         xyxy = boxes.xyxy.cpu().numpy()
         cls = boxes.cls.cpu().numpy().astype(int)
         confs = boxes.conf.cpu().numpy()
-
         mask_np = None
         if masks is not None and masks.data is not None:
             m = masks.data  # (N,H,W)
             mask_np = (m.cpu().numpy() > 0.5).astype(np.uint8)
 
         for i in range(len(xyxy)):
-            cls_id = int(cls[i])
-            cls_name = names_map.get(cls_id, str(cls_id))
-            conf_i = float(confs[i])
-            xyxy_i = xyxy[i]
-
+            cls_id = int(cls[i]); cls_name = names_map.get(cls_id, str(cls_id))
+            conf_i = float(confs[i]); xyxy_i = xyxy[i]
             if mask_np is not None and i < mask_np.shape[0]:
                 mask_area, bbox_area, ratio, severity = compute_severity(mask_np[i], xyxy_i)
             else:
                 bbox_area = max(1, int((xyxy_i[2]-xyxy_i[0])*(xyxy_i[3]-xyxy_i[1])))
                 mask_area, ratio, severity = 0, 0.0, "Light"
-
             records.append({
-                "class_id": cls_id,
-                "class_name": cls_name,
-                "confidence": conf_i,  # disimpan, tak ditampilkan
-                "x1": int(xyxy_i[0]), "y1": int(xyxy_i[1]),
-                "x2": int(xyxy_i[2]), "y2": int(xyxy_i[3]),
-                "mask_area": int(mask_area),
-                "bbox_area": int(bbox_area),
-                "area_ratio": float(ratio),
-                "severity": severity
+                "class_id": cls_id, "class_name": cls_name, "confidence": conf_i,
+                "x1": int(xyxy_i[0]), "y1": int(xyxy_i[1]), "x2": int(xyxy_i[2]), "y2": int(xyxy_i[3]),
+                "mask_area": int(mask_area), "bbox_area": int(bbox_area),
+                "area_ratio": float(ratio), "severity": severity
             })
-
     return overlay_pil, records
 
 # ==========================
@@ -251,7 +219,6 @@ if "clear_inputs" not in st.session_state:
 # ==========================
 with st.sidebar:
     st.header("📝 Add Vehicle")
-
     if st.session_state.clear_inputs:
         st.session_state.input_plate = ""
         st.session_state.clear_inputs = False
@@ -262,7 +229,7 @@ with st.sidebar:
         value=st.session_state.input_plate,
         placeholder="B 1234 ABC",
         max_chars=11,
-        help="Format: [A-Z] [1-4 digits] [A-Z][A-Z][A-Z]"
+        help="Format: [A-Z] [1–4 digits] [A-Z][A-Z][A-Z]"
     )
 
     files = st.file_uploader(
@@ -309,7 +276,7 @@ with tab_batch:
         st.header("📖 Informasi")
         st.markdown("""
         **Severity Levels:**
-        - 🟢 **Light**: Kerusakan ringan (< 25% area)
+        - 🟢 **Light**: < 25% area
         - 🟡 **Medium**: 25–60% area
         - 🔴 **Heavy**: > 60% area
         """)
@@ -418,7 +385,7 @@ with tab_batch:
             progress_bar.empty()
 
 # --------------------------
-# Real-Time Scan (Auto-Start)
+# Real-Time Scan (Auto-Start, camera index 0)
 # --------------------------
 with tab_realtime:
     st.header("🟢 Real-Time Scan")
@@ -426,8 +393,7 @@ with tab_realtime:
 
     # Auto-start saat tab dibuka
     if AUTO_START_RT and not st.session_state.rt_auto_started and not st.session_state.rt_streaming:
-        chosen = None
-        last_err = None
+        chosen = None; last_err = None
         for candidate in FALLBACK_CAMERA_SRCS:
             cap_test, err = open_video_capture(candidate)
             if err is None:
@@ -440,10 +406,10 @@ with tab_realtime:
             st.session_state.rt_streaming = True
             st.session_state.rt_auto_started = True
         else:
-            st.error(last_err or "Tidak bisa membuka sumber video. Periksa index/URL kamera.")
-            st.info("Nonaktifkan AUTO_START_RT atau set env var CAMERA_SRC/DEFAULT_CAMERA_SRC yang valid.")
+            st.error(last_err or "Tidak bisa membuka sumber video.")
+            st.info("Pastikan webcam tersedia & tidak sedang dipakai aplikasi lain.")
 
-    # Info source & tombol Stop saja (Start tidak diperlukan)
+    # Info source & tombol Stop
     col_info, col_btn = st.columns([3, 1])
     with col_info:
         st.caption(f"Source: **{st.session_state.rt_src}**  |  AUTO_START_RT: {AUTO_START_RT}")
@@ -464,42 +430,41 @@ with tab_realtime:
             st.success("Streaming aktif. Gunakan tombol Stop untuk berhenti.")
             frame_count = 0
             prev_t = datetime.now()
+            stride = 3  # proses 1 dari 3 frame (hemat CPU)
 
             while st.session_state.rt_streaming:
                 ok, frame = cap.read()
                 if not ok or frame is None:
-                    st.warning("Frame tidak terbaca. Memeriksa koneksi kamera...")
+                    st.warning("Frame tidak terbaca. Periksa koneksi/kamera...")
                     st.experimental_sleep(0.1)
                     continue
 
                 frame_count += 1
-                do_infer = (frame_count % 3 == 0)  # stride default = 3 (hemat CPU)
+                do_infer = (frame_count % stride == 0)
 
                 pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 if do_infer:
-                    overlay_pil, _ = run_inference_on_image(model, pil_frame,
-                                                            conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ)
+                    overlay_pil, _ = run_inference_on_image(
+                        model, pil_frame, conf=FIXED_CONF, iou=FIXED_IOU, imgsz=FIXED_IMGSZ
+                    )
                     show_pil = overlay_pil if overlay_pil is not None else pil_frame
                 else:
                     show_pil = pil_frame
 
-                now = datetime.now()
-                dt = (now - prev_t).total_seconds()
+                now = datetime.now(); dt = (now - prev_t).total_seconds()
                 fps = (1.0 / dt) if dt > 0 else 0.0
                 prev_t = now
 
-                rt_image_placeholder.image(show_pil, caption=f"Real-Time Detection (auto-start, stride=3)", use_container_width=True)
+                rt_image_placeholder.image(show_pil, caption=f"Real-Time Detection (stride={stride})", use_container_width=True)
                 rt_info_placeholder.info(f"FPS ~ {fps:.1f} | Source: {st.session_state.rt_src}")
 
                 st.experimental_sleep(0.001)
 
-            try:
-                cap.release()
-            except Exception:
-                pass
+            try: cap.release()
+            except Exception: pass
             st.warning("Streaming dihentikan.")
     else:
-        st.info("Real-Time belum aktif. (AUTO_START_RT=False atau kamera belum tersedia)")
+        st.info("Real-Time belum aktif. (Kamera belum tersedia atau dipakai aplikasi lain)")
 
 # ==========================
 # Footer
