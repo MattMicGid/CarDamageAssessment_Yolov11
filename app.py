@@ -262,6 +262,7 @@ with col_stats:
 # ==========================
 st.markdown("---")
 st.caption("📸 Live YOLO segmentation — labels only (no confidence text).")# ==========================
+tab1, tab2, tab3 = st.tabs(["📷 Camera Capture", "📁 Upload Images", "📊 Results"])
 with tab1:
     st.header("📷 Camera Capture")
     st.markdown("Ambil foto menggunakan kamera untuk deteksi kerusakan mobil.")
