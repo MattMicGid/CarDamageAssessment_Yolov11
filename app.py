@@ -24,7 +24,7 @@ st.set_page_config(page_title="Car Damage Detection", layout="wide", page_icon="
 
 # Settings
 WEIGHTS_FILE = "best.pt"
-FIXED_CONF = 0.25
+FIXED_CONF = 0.15
 FIXED_IOU = 0.7
 FIXED_IMGSZ = 416
 
