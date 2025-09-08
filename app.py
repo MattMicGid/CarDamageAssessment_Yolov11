@@ -339,7 +339,8 @@ with st.sidebar:
 # ==========================
 st.divider()
 st.caption("🛠️ Simple car damage detection without complex streaming")
-st.caption("📱 Works on all devices and networks")            model = YOLO(WEIGHTS_FILE)
+st.caption("📱 Works on all devices and networks")            
+model = YOLO(WEIGHTS_FILE)
             model.fuse()
             return model
         else:
