@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 import io
+import queue
 
 # Import YOLO
 try:
