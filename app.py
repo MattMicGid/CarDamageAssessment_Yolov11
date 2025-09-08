@@ -28,8 +28,8 @@ st.set_page_config(page_title="Car Damage Detection (Streaming)", page_icon="�
 st.title("🚗 Car Damage Detection — Live Streaming with Segmentation")
 
 WEIGHTS_FILE = "best.pt"          # taruh model di root app
-CONF_THRES   = 0.25
-IOU_THRES    = 0.7
+CONF_THRES   = 0.10
+IOU_THRES    = 0.6
 IMG_SIZE     = 416
 
 # ==========================
@@ -102,15 +102,47 @@ with st.sidebar:
     mask_alpha = st.slider("Mask Opacity", 0.0, 1.0, 0.55, 0.05)
 
     st.markdown("---")
-    st.caption("🎥 Tips: di mobile, app akan minta kamera **belakang** (environment).")
+    st.subheader("🎥 Camera")
+    cam_choice = st.radio(
+        "Pilih kamera",
+        ["Belakang (environment)", "Depan (user)", "Auto"],
+        index=0,
+        help="Di ponsel, 'Belakang' biasanya kamera utama. Di desktop, browser bisa mengabaikan preferensi ini."
+    )
+
+    res_label = st.selectbox(
+        "Resolusi video",
+        ["1280×720", "1920×1080", "640×480"],
+        index=0
+    )
+    fps = st.slider("FPS", 10, 60, 24, 1)
+
+    # parse resolusi
+    try:
+        w, h = map(int, res_label.replace("×", "x").split("x"))
+    except Exception:
+        w, h = 1280, 720
+
+    # Build constraints dinamis
+    video_constraints = {
+        "width": {"ideal": w},
+        "height": {"ideal": h},
+        "frameRate": {"ideal": fps, "max": min(30, fps)},  # 30 aman untuk WebRTC
+    }
+    if cam_choice == "Belakang (environment)":
+        video_constraints["facingMode"] = {"exact": "environment"}
+    elif cam_choice == "Depan (user)":
+        video_constraints["facingMode"] = {"exact": "user"}
+    else:
+        video_constraints["facingMode"] = {"ideal": "environment"}
+
+    st.caption("💡 Tips: Safari/iOS butuh HTTPS agar kamera bisa dipakai. Jika perangkat tidak punya kamera belakang, browser akan fallback ke yang tersedia.")
 
 # ==========================
 # RESULT QUEUE (for right pane)
 # ==========================
 result_queue: "queue.Queue[dict]" = queue.Queue()
-
-# Simpan ringkas 200 deteksi terakhir untuk statistik ringan
-recent_detections = deque(maxlen=200)
+recent_detections = deque(maxlen=200)  # Simpan ringkas 200 deteksi terakhir
 
 # ==========================
 # VIDEO PROCESSOR
@@ -139,10 +171,9 @@ class YOLOSegProcessor(VideoProcessorBase):
         overlay = img_bgr.copy()
 
         # Draw masks (no confidence text)
-        if show_masks and hasattr(r, "masks") and r.masks is not None:
+        if hasattr(r, "masks") and r.masks is not None:
             masks = r.masks.data.cpu().numpy()  # [N, Hm, Wm]
             if masks.size > 0:
-                # Resize each mask to frame size
                 for mask, cls_id in zip(masks, r.boxes.cls.cpu().numpy().astype(int)):
                     mask_resized = cv2.resize(mask, (w, h))
                     m = mask_resized > 0.5
@@ -150,10 +181,16 @@ class YOLOSegProcessor(VideoProcessorBase):
                     overlay[m] = (0.45 * np.array(col) + 0.55 * overlay[m]).astype(np.uint8)
 
         # Blend if any mask
-        img_draw = cv2.addWeighted(overlay, mask_alpha if show_masks else 0, img_bgr, 1 - (mask_alpha if show_masks else 0), 0)
+        img_draw = cv2.addWeighted(
+            overlay,
+            mask_alpha if show_masks else 0,
+            img_bgr,
+            1 - (mask_alpha if show_masks else 0),
+            0,
+        )
 
         # Draw boxes + labels (without confidence)
-        if show_boxes and hasattr(r, "boxes") and r.boxes is not None and len(r.boxes) > 0:
+        if hasattr(r, "boxes") and r.boxes is not None and len(r.boxes) > 0:
             xyxy = r.boxes.xyxy.cpu().numpy()
             clss = r.boxes.cls.cpu().numpy().astype(int)
             confs = r.boxes.conf.cpu().numpy()
@@ -163,12 +200,12 @@ class YOLOSegProcessor(VideoProcessorBase):
                 x1, y1, x2, y2 = box.astype(int)
                 cname = names.get(cid, str(cid))
                 col = color_for(cname)
-                cv2.rectangle(img_draw, (x1, y1), (x2, y2), col, 3)
-
+                if show_boxes:
+                    cv2.rectangle(img_draw, (x1, y1), (x2, y2), col, 3)
                 if show_labels:
                     put_label(img_draw, cname, x1, y1)
 
-                # Push compact result (no conf displayed)
+                # Push compact result (no conf displayed on frame)
                 try:
                     result_queue.put_nowait({
                         "time": datetime.now().strftime("%H:%M:%S"),
@@ -194,13 +231,7 @@ webrtc_ctx = webrtc_streamer(
     rtc_configuration=rtc_config,
     video_processor_factory=YOLOSegProcessor,
     media_stream_constraints={
-        "video": {
-            "width": {"ideal": 1280},
-            "height": {"ideal": 720},
-            "frameRate": {"ideal": 24, "max": 30},
-            # Minta kamera belakang saat di ponsel
-            "facingMode": {"ideal": "environment"},
-        },
+        "video": video_constraints,
         "audio": False,
     },
 )
