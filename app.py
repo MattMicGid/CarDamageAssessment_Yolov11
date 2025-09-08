@@ -1,13 +1,14 @@
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import numpy as np
 import pandas as pd
 import cv2
 import time
 from datetime import datetime
 from pathlib import Path
+import threading
+import tempfile
 import io
-import queue
 
 # Import YOLO
 try:
@@ -19,11 +20,11 @@ except ImportError:
 # ==========================
 # SIMPLE CONFIG
 # ==========================
-st.set_page_config(page_title="Car Damage Detection Streaming", layout="wide", page_icon="🚗")
+st.set_page_config(page_title="Car Damage Detection", layout="wide", page_icon="🚗")
 
 # Settings
 WEIGHTS_FILE = "best.pt"
-FIXED_CONF = 0.10
+FIXED_CONF = 0.25
 FIXED_IOU = 0.7
 FIXED_IMGSZ = 416
 
@@ -31,23 +32,13 @@ FIXED_IMGSZ = 416
 SEVERITY_T1 = 0.25
 SEVERITY_T2 = 0.60
 
-# Color map for damage types (example colors)
-COLORS = {
-    "scratch": (255, 0, 0),      # Red
-    "dent": (0, 255, 0),         # Green
-    "crack": (0, 0, 255),        # Blue
-    "default": (255, 255, 0)     # Yellow
-}
-
 # ==========================
 # SESSION STATE
 # ==========================
 if 'detection_results' not in st.session_state:
     st.session_state.detection_results = []
-if 'streaming' not in st.session_state:
-    st.session_state.streaming = False
-if 'last_frame' not in st.session_state:
-    st.session_state.last_frame = None
+if 'camera_active' not in st.session_state:
+    st.session_state.camera_active = False
 
 # ==========================
 # MODEL LOADING
@@ -64,398 +55,94 @@ def load_model():
         else:
             return None
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        st.error(f"Error: {e}")
         return None
-
-# ==========================
-# Helper functions for drawing clean segmentation
-# ==========================
-def draw_clean_segmentation(image, results, show_labels=False):
-    """Draw clean segmentation masks without text"""
-    image_np = np.array(image)
-
-    if not hasattr(results, 'masks') or results.masks is None:
-        # fallback to boxes if no masks
-        return image
-
-    masks = results.masks.data.cpu().numpy()
-    classes = results.boxes.cls.cpu().numpy().astype(int)
-    names = results.names
-
-    overlay = image_np.copy()
-
-    # Try to load font for labels
-    font = None
-    if show_labels:
-        try:
-            from PIL import ImageFont
-            font = ImageFont.truetype("arial.ttf", 16)
-        except:
-            font = ImageFont.load_default()
-
-    for mask, cls_id in zip(masks, classes):
-        class_name = names.get(cls_id, str(cls_id)).lower()
-        color = COLORS.get(class_name, COLORS['default'])
-
-        # Resize mask to image size
-        mask_resized = cv2.resize(mask, (image_np.shape[1], image_np.shape[0]))
-
-        mask_indices = mask_resized > 0.5
-        overlay[mask_indices] = (overlay[mask_indices] * 0.4 + np.array(color) * 0.6).astype(np.uint8)
-
-        if show_labels and font:
-            y_indices, x_indices = np.where(mask_indices)
-            if len(y_indices) > 0:
-                centroid_x = int(np.mean(x_indices))
-                centroid_y = int(np.mean(y_indices))
-                pil_overlay = Image.fromarray(overlay)
-                draw = ImageDraw.Draw(pil_overlay)
-                text = names.get(cls_id, str(cls_id))
-                draw.text((centroid_x, centroid_y), text, fill=(255, 255, 255), font=font)
-                overlay = np.array(pil_overlay)
-
-    alpha = 0.6
-    result = cv2.addWeighted(image_np, 1 - alpha, overlay, alpha, 0)
-    return Image.fromarray(result)
-
-def get_severity_from_area(bbox_area):
-    if bbox_area < 5000:
-        return "Light"
-    elif bbox_area < 15000:
-        return "Medium"
-    else:
-        return "Heavy"
 
 # ==========================
 # INFERENCE FUNCTION
 # ==========================
-def run_inference_segmentation(model, image, show_labels=False):
+def run_inference_simple(model, image):
+    """
+    Jalankan prediksi dan kembalikan:
+    - annotated_rgb: gambar anotasi (bbox + mask + label NAMA SAJA, TANPA confidence)
+    - detections: list dict hasil deteksi (nama, confidence (internal), severity, timestamp)
+    """
     try:
-        image_np = np.array(image)
+        # Run prediction
         results = model.predict(
-            source=image_np,
+            source=image,
             conf=FIXED_CONF,
             iou=FIXED_IOU,
             imgsz=FIXED_IMGSZ,
             verbose=False
         )
+
         r = results[0]
         detections = []
 
+        # --- Render annotated image WITHOUT confidence text ---
+        # Beberapa versi Ultralytics mendukung argumen conf=..., beberapa mengabaikan.
+        try:
+            annotated = r.plot(labels=True, conf=False, boxes=True, masks=True)  # -> BGR
+        except TypeError:
+            # Fallback untuk versi lama: tidak ada argumen conf, tetap akan render label nama
+            annotated = r.plot(labels=True, boxes=True, masks=True)
+
+        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+        # --- Ekstrak detections (nama + ukuran bbox untuk severity) ---
         if hasattr(r, 'boxes') and r.boxes is not None and len(r.boxes) > 0:
             boxes = r.boxes.xyxy.cpu().numpy()
             classes = r.boxes.cls.cpu().numpy().astype(int)
             confs = r.boxes.conf.cpu().numpy()
-            names = r.names
+            names = r.names if hasattr(r, "names") and r.names is not None else {}
 
             for box, cls_id, conf in zip(boxes, classes, confs):
                 cls_name = names.get(cls_id, str(cls_id))
-                bbox_area = (box[2] - box[0]) * (box[3] - box[1])
-                severity = get_severity_from_area(bbox_area)
+
+                # Simple severity pakai luas bbox (px^2)
+                bbox_area = float((box[2] - box[0]) * (box[3] - box[1]))
+                if bbox_area < 5000:
+                    severity = "Light"
+                elif bbox_area < 15000:
+                    severity = "Medium"
+                else:
+                    severity = "Heavy"
+
                 detections.append({
                     "class_name": cls_name,
-                    "confidence": float(conf),
+                    "confidence": float(conf),   # disimpan internal, TIDAK ditampilkan
                     "severity": severity,
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "bbox": box.tolist(),
-                    "area": int(bbox_area)
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
                 })
 
-        annotated_img = draw_clean_segmentation(image, r, show_labels)
-        return annotated_img, detections
+        return annotated_rgb, detections
 
-    except Exception as e:
-        st.error(f"Inference error: {e}")
+    except Exception:
+        # Jika gagal, kembalikan gambar input agar UI tetap jalan
         return image, []
-
-# ==========================
-# STREAMING FUNCTION
-# ==========================
-def streaming_camera(model, annotation_type="segmentation", show_labels=False):
-    st.header("🚗 Streaming Camera with Instance Segmentation")
-    st.markdown("Tekan tombol Start untuk memulai streaming kamera dan deteksi kerusakan secara real-time.")
-
-    start_button = st.button("▶️ Start Streaming")
-    stop_button = st.button("⏹️ Stop Streaming")
-
-    if start_button:
-        st.session_state.streaming = True
-    if stop_button:
-        st.session_state.streaming = False
-
-    frame_placeholder = st.empty()
-    info_placeholder = st.empty()
-
-    if st.session_state.streaming:
-        camera = st.camera_input("Streaming Camera (ambil frame secara manual)")
-
-        # Karena st.camera_input hanya mengambil satu frame per input,
-        # kita buat loop manual dengan tombol refresh (bisa juga pakai streamlit-webrtc untuk video streaming nyata)
-        st.info("Streaming aktif. Ambil frame dengan tombol kamera di atas.")
-
-        if camera is not None:
-            image = Image.open(camera).convert('RGB')
-            annotated_img, detections = run_inference_segmentation(model, image, show_labels)
-
-            # Simpan hasil deteksi ke session state
-            for det in detections:
-                det['source'] = 'streaming'
-            st.session_state.detection_results.extend(detections)
-
-            frame_placeholder.image(annotated_img, caption="🎯 Deteksi Instance Segmentation", use_container_width=True)
-            info_placeholder.info(f"Deteksi: {len(detections)} kerusakan terdeteksi pada {datetime.now().strftime('%H:%M:%S')}")
-
-            # Download button untuk gambar hasil anotasi
-            img_bytes = io.BytesIO()
-            annotated_img.save(img_bytes, format='PNG')
-            img_bytes.seek(0)
-            st.download_button(
-                "💾 Download Annotated Frame",
-                img_bytes.getvalue(),
-                f"annotated_stream_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                "image/png"
-            )
-        else:
-            st.info("Ambil foto dengan tombol kamera di atas untuk streaming frame.")
-
-    else:
-        st.info("Streaming dimatikan. Tekan Start Streaming untuk mulai.")
 
 # ==========================
 # MAIN APP
 # ==========================
-def main():
-    st.title("🚗 Car Damage Detection with Streaming Instance Segmentation")
+st.title("🚗 Car Damage Detection System")
 
-    model = load_model()
-    if model is None:
-        st.error("❌ Model tidak tersedia! Pastikan file 'best.pt' ada di direktori yang sama.")
-        st.stop()
+# Load model
+model = load_model()
+if model is None:
+    st.error("❌ Model tidak tersedia! Pastikan file 'best.pt' ada.")
+    st.stop()
 
-    st.success(f"✅ Model loaded: {WEIGHTS_FILE}")
-
-    # Sidebar settings
-    with st.sidebar:
-        st.header("🎨 Annotation Settings")
-        show_class_labels = st.checkbox("Show Class Labels", value=True)
-        st.markdown("---")
-        st.header("ℹ️ Info")
-        st.markdown("""
-        - Gunakan tab Streaming untuk deteksi real-time dengan kamera.
-        - Model instance segmentation YOLO digunakan untuk deteksi dan anotasi.
-        """)
-
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📹 Streaming Camera", "📁 Upload Images", "📊 Results"])
-
-    with tab1:
-        streaming_camera(model, annotation_type="segmentation", show_labels=show_class_labels)
-
-    with tab2:
-        st.header("📁 Upload Images for Batch Processing")
-        uploaded_files = st.file_uploader(
-            "Upload images",
-            type=["jpg", "jpeg", "png"],
-            accept_multiple_files=True
-        )
-        if uploaded_files:
-            st.write(f"{len(uploaded_files)} file(s) uploaded")
-            if st.button("🚀 Process All Images"):
-                progress_bar = st.progress(0)
-                for idx, uploaded_file in enumerate(uploaded_files):
-                    image = Image.open(uploaded_file).convert('RGB')
-                    annotated_img, detections = run_inference_segmentation(model, image, show_class_labels)
-                    st.image(annotated_img, caption=f"Processed: {uploaded_file.name}", use_container_width=True)
-                    if detections:
-                        for det in detections:
-                            det['filename'] = uploaded_file.name
-                            det['source'] = 'upload'
-                        st.session_state.detection_results.extend(detections)
-                        st.success(f"Found {len(detections)} damage(s) in {uploaded_file.name}")
-                    else:
-                        st.info(f"No damage detected in {uploaded_file.name}")
-                    progress_bar.progress((idx + 1) / len(uploaded_files))
-                progress_bar.empty()
-                st.success("Batch processing completed!")
-
-    with tab3:
-        st.header("📊 Detection Results")
-        if st.session_state.detection_results:
-            df = pd.DataFrame(st.session_state.detection_results)
-            st.dataframe(df, use_container_width=True)
-            csv_data = df.to_csv(index=False)
-            st.download_button(
-                "📥 Download All Results as CSV",
-                csv_data,
-                f"detection_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv"
-            )
-            if st.button("🗑️ Clear Results"):
-                st.session_state.detection_results = []
-                st.experimental_rerun()
-        else:
-            st.info("No detection results yet.")
-
-if __name__ == "__main__":
-    main()
-# RESULT QUEUE (for right pane)
-# ==========================
-result_queue: "queue.Queue[dict]" = queue.Queue()
-
-# Simpan ringkas 200 deteksi terakhir untuk statistik ringan
-recent_detections = deque(maxlen=200)
+st.success(f"✅ Model loaded: {WEIGHTS_FILE}")
 
 # ==========================
-# VIDEO PROCESSOR
+# TABS
 # ==========================
-class YOLOSegProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.model = model
-        self.lock = threading.Lock()
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img_bgr = frame.to_ndarray(format="bgr24")
-        h, w = img_bgr.shape[:2]
-
-        # Inference
-        with self.lock:
-            results = self.model.predict(
-                source=img_bgr,
-                conf=CONF_THRES,
-                iou=IOU_THRES,
-                imgsz=IMG_SIZE,
-                verbose=False
-            )
-        r = results[0]
-
-        # Prepare overlay for masks
-        overlay = img_bgr.copy()
-
-        # Draw masks (no confidence text)
-        if show_masks and hasattr(r, "masks") and r.masks is not None:
-            masks = r.masks.data.cpu().numpy()  # [N, Hm, Wm]
-            if masks.size > 0:
-                # Resize each mask to frame size
-                for mask, cls_id in zip(masks, r.boxes.cls.cpu().numpy().astype(int)):
-                    mask_resized = cv2.resize(mask, (w, h))
-                    m = mask_resized > 0.5
-                    col = color_for(r.names.get(cls_id, str(cls_id)))
-                    overlay[m] = (0.45 * np.array(col) + 0.55 * overlay[m]).astype(np.uint8)
-
-        # Blend if any mask
-        img_draw = cv2.addWeighted(overlay, mask_alpha if show_masks else 0, img_bgr, 1 - (mask_alpha if show_masks else 0), 0)
-
-        # Draw boxes + labels (without confidence)
-        if show_boxes and hasattr(r, "boxes") and r.boxes is not None and len(r.boxes) > 0:
-            xyxy = r.boxes.xyxy.cpu().numpy()
-            clss = r.boxes.cls.cpu().numpy().astype(int)
-            confs = r.boxes.conf.cpu().numpy()
-            names = r.names
-
-            for box, cid, conf in zip(xyxy, clss, confs):
-                x1, y1, x2, y2 = box.astype(int)
-                cname = names.get(cid, str(cid))
-                col = color_for(cname)
-                cv2.rectangle(img_draw, (x1, y1), (x2, y2), col, 3)
-
-                if show_labels:
-                    put_label(img_draw, cname, x1, y1)
-
-                # Push compact result (no conf displayed)
-                try:
-                    result_queue.put_nowait({
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                        "class_name": cname,
-                        "severity": severity_from_bbox(box),
-                        "confidence": float(conf),  # disimpan untuk analitik, tidak ditulis di frame
-                    })
-                except queue.Full:
-                    pass
-
-        return av.VideoFrame.from_ndarray(img_draw, format="bgr24")
-
-# ==========================
-# WEBRTC STREAM
-# ==========================
-rtc_config = RTCConfiguration({
-    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-})
-
-webrtc_ctx = webrtc_streamer(
-    key="yolo-seg-stream",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration=rtc_config,
-    video_processor_factory=YOLOSegProcessor,
-    media_stream_constraints={
-        "video": {
-            "width": {"ideal": 1280},
-            "height": {"ideal": 720},
-            "frameRate": {"ideal": 24, "max": 30},
-            # Minta kamera belakang saat di ponsel
-            "facingMode": {"ideal": "environment"},
-        },
-        "audio": False,
-    },
-)
-
-# ==========================
-# RIGHT PANE: Live Stats
-# ==========================
-col_stream, col_stats = st.columns([2, 1])
-
-with col_stats:
-    st.subheader("📊 Live Results")
-    status_box = st.empty()
-    table_box = st.empty()
-    chart_box1 = st.empty()
-    chart_box2 = st.empty()
-
-    # Drain queue periodically
-    def drain_results():
-        drained = []
-        while True:
-            try:
-                item = result_queue.get_nowait()
-                drained.append(item)
-            except queue.Empty:
-                break
-        return drained
-
-    if webrtc_ctx.state.playing:
-        status_box.info("🔴 Streaming aktif — arahkan kamera ke area kerusakan.")
-
-        # live loop (uses Streamlit rerun on each script run)
-        new_items = drain_results()
-        recent_detections.extend(new_items)
-
-        if len(recent_detections) > 0:
-            df = pd.DataFrame(list(recent_detections))
-            # Ringkas
-            total = len(df)
-            heavy = (df["severity"] == "Heavy").sum()
-            cls_counts = df["class_name"].value_counts()
-
-            st.metric("Detections (recent)", total)
-            st.metric("Heavy", heavy)
-
-            # Tabel mini (tanpa confidence display)
-            show_df = df[["time", "class_name", "severity"]].tail(12)
-            table_box.dataframe(show_df, use_container_width=True, height=320)
-
-            chart_box1.bar_chart(cls_counts)
-            sev_counts = df["severity"].value_counts()
-            chart_box2.bar_chart(sev_counts)
-        else:
-            status_box.info("Menunggu deteksi…")
-    else:
-        status_box.warning("Streaming belum dimulai. Klik **Start** pada komponen kamera di atas.")
-
-# ==========================
-# FOOTER
-# ==========================
-st.markdown("---")
-st.caption("📸 Live YOLO segmentation — labels only (no confidence text).")# ==========================
 tab1, tab2, tab3 = st.tabs(["📷 Camera Capture", "📁 Upload Images", "📊 Results"])
+
+# ==========================
+# TAB 1: CAMERA CAPTURE (Simple approach)
+# ==========================
 with tab1:
     st.header("📷 Camera Capture")
     st.markdown("Ambil foto menggunakan kamera untuk deteksi kerusakan mobil.")
@@ -1374,596 +1061,4 @@ with tab3:
                 st.button("📊 Download Filtered", disabled=True, use_container_width=True)
         
         with col_export3:
-            # Summary report
-            summary_data = {
-                "Total Detections": [len(df)],
-                "Damage Types": [df['class_name'].nunique()],
-                "Average Confidence": [f"{df['confidence'].mean():.1%}"],
-                "Heavy Damage Count": [len(df[df['severity'] == 'Heavy'])],
-                "Most Common Damage": [df['class_name'].value_counts().index[0] if len(df) > 0 else "None"],
-                "Generated": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
-            }
-            summary_df = pd.DataFrame(summary_data)
-            summary_csv = summary_df.to_csv(index=False)
-            st.download_button(
-                "📋 Download Summary",
-                summary_csv,
-                f"summary_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv",
-                use_container_width=True
-            )
-        
-        with col_export4:
-            # Clear results
-            if st.button("🗑️ Clear All Results", use_container_width=True):
-                st.session_state.detection_results = []
-                st.success("✅ All results cleared!")
-                st.rerun()
-        
-        # Advanced analytics
-        if len(df) > 5:
-            st.markdown("### 🔬 Advanced Analytics")
-            
-            # Time-based analysis if we have timestamps
-            if 'timestamp' in df.columns:
-                st.markdown("#### ⏰ Detection Timeline")
-                # Convert timestamp to datetime for better plotting
-                try:
-                    df_time = df.copy()
-                    df_time['hour'] = pd.to_datetime(df_time['timestamp'], format='%H:%M:%S').dt.hour
-                    hourly_counts = df_time.groupby('hour').size()
-                    st.bar_chart(hourly_counts)
-                    
-                    peak_hour = hourly_counts.idxmax()
-                    st.info(f"🕐 Peak detection hour: {peak_hour}:00 ({hourly_counts.max()} detections)")
-                except:
-                    st.info("⏰ Timeline analysis not available")
-            
-            # Correlation analysis
-            if 'area' in df.columns:
-                st.markdown("#### 📐 Size vs Confidence Correlation")
-                correlation_data = df[['area', 'confidence']].copy()
-                st.scatter_chart(correlation_data.set_index('area'))
-                
-                correlation = df['area'].corr(df['confidence'])
-                if abs(correlation) > 0.5:
-                    st.info(f"📊 Strong correlation detected: {correlation:.2f}")
-                else:
-                    st.info(f"📊 Weak correlation: {correlation:.2f}")
-    
-    else:
-        # No results yet
-        st.info("🔍 No detection results yet. Use **Camera Capture** or **Upload Images** to start analyzing!")
-        
-        # Quick start guide
-        st.markdown("### 🚀 Quick Start Guide")
-        
-        col_guide1, col_guide2 = st.columns(2)
-        
-        with col_guide1:
-            st.markdown("""
-            #### 📷 Camera Method
-            1. Go to **Camera Capture** tab
-            2. Click the camera button to take a photo
-            3. Click **Analyze Damage** button
-            4. View clean annotations and results
-            """)
-        
-        with col_guide2:
-            st.markdown("""
-            #### 📁 Upload Method
-            1. Go to **Upload Images** tab
-            2. Select multiple image files
-            3. Click **Process All Images**
-            4. Export batch results
-            """)
-        
-        # Sample data preview
-        st.markdown("### 📊 Expected Results Format")
-        sample_data = {
-            "class_name": ["dent", "scratch", "crack"],
-            "confidence": ["85.2%", "92.1%", "76.8%"],
-            "severity": ["Medium", "Heavy", "Light"],
-            "timestamp": ["14:30:15", "14:30:16", "14:30:17"]
-        }
-        sample_df = pd.DataFrame(sample_data)
-        st.dataframe(sample_df, use_container_width=True)
-
-# ==========================
-# TAB 4: ABOUT
-# ==========================
-with tab4:
-    st.header("🔧 About Car Damage Detection System")
-    
-    st.markdown("""
-    ### 🎯 System Overview
-    
-    This professional car damage detection system uses advanced **YOLO (You Only Look Once)** 
-    computer vision technology to automatically identify and classify vehicle damage with 
-    clean, professional annotations.
-    
-    ### ✨ Key Features
-    
-    - **🎨 Clean Annotations**: No cluttered confidence text - professional look
-    - **🎯 Multi-Type Detection**: Supports dent, scratch, crack, rust, and more
-    - **📊 Real-time Analysis**: Fast processing with immediate results
-    - **🔄 Batch Processing**: Handle multiple images simultaneously  
-    - **📈 Advanced Analytics**: Comprehensive reporting and statistics
-    - **💾 Export Capabilities**: CSV, image, and summary report exports
-    - **📱 Mobile Friendly**: Works on all devices and screen sizes
-    """)
-    
-    # Technical specifications
-    st.markdown("### ⚙️ Technical Specifications")
-    
-    col_tech1, col_tech2 = st.columns(2)
-    
-    with col_tech1:
-        st.markdown("""
-        #### 🧠 AI Model Details
-        - **Architecture**: YOLO (You Only Look Once)
-        - **Framework**: Ultralytics YOLOv8/v11
-        - **Input Size**: 416x416 pixels
-        - **Confidence Threshold**: 15%
-        - **IoU Threshold**: 70%
-        """)
-    
-    with col_tech2:
-        st.markdown("""
-        #### 📊 Detection Capabilities
-        - **Damage Types**: Dent, Scratch, Crack, Rust, Broken
-        - **Severity Levels**: Light, Medium, Heavy
-        - **Annotation Types**: Bounding Boxes, Segmentation
-        - **Color Coding**: Automatic damage type identification
-        """)
-    
-    # Performance metrics
-    st.markdown("### 📈 Performance Metrics")
-    
-    # Create sample performance data
-    performance_data = {
-        "Metric": ["Processing Speed", "Average Confidence", "Detection Accuracy", "False Positive Rate"],
-        "Value": ["< 2 seconds", "85-95%", "High", "Low"],
-        "Description": [
-            "Time to process single image",
-            "Typical confidence range",
-            "Based on model training",
-            "Minimal false detections"
-        ]
-    }
-    performance_df = pd.DataFrame(performance_data)
-    st.dataframe(performance_df, use_container_width=True, hide_index=True)
-    
-    # Usage statistics (if available)
-    if st.session_state.detection_results:
-        st.markdown("### 📊 Current Session Statistics")
-        
-        session_df = pd.DataFrame(st.session_state.detection_results)
-        
-        col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
-        
-        with col_stat1:
-            st.metric("Images Processed", 
-                     session_df['filename'].nunique() if 'filename' in session_df.columns else len(session_df))
-        
-        with col_stat2:
-            st.metric("Total Detections", len(session_df))
-        
-        with col_stat3:
-            avg_processing_time = session_df['processing_time'].mean() if 'processing_time' in session_df.columns else 0
-            st.metric("Avg Processing Time", f"{avg_processing_time:.2f}s" if avg_processing_time > 0 else "N/A")
-        
-        with col_stat4:
-            accuracy_estimate = session_df['confidence'].mean()
-            st.metric("Session Accuracy", f"{accuracy_estimate:.1%}")
-    
-    # Color reference
-    st.markdown("### 🎨 Color Reference Guide")
-    
-    color_guide = []
-    for damage_type, color in COLORS.items():
-        if damage_type != 'default':
-            color_guide.append({
-                "Damage Type": damage_type.title(),
-                "Color (RGB)": f"({color[0]}, {color[1]}, {color[2]})",
-                "Hex Code": f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}",
-                "Usage": "Bounding boxes and segmentation masks"
-            })
-    
-    color_df = pd.DataFrame(color_guide)
-    st.dataframe(color_df, use_container_width=True, hide_index=True)
-    
-    # System requirements
-    st.markdown("### 💻 System Requirements")
-    
-    col_req1, col_req2 = st.columns(2)
-    
-    with col_req1:
-        st.markdown("""
-        #### Minimum Requirements
-        - **RAM**: 4GB+ recommended
-        - **Storage**: 2GB for model files
-        - **Internet**: Required for initial setup
-        - **Browser**: Modern browser with camera support
-        """)
-    
-    with col_req2:
-        st.markdown("""
-        #### Supported Formats
-        - **Input**: JPG, JPEG, PNG, BMP, TIFF
-        - **Output**: PNG (annotated images), CSV (data)
-        - **Camera**: Built-in device camera support
-        - **Batch**: Multiple file processing
-        """)
-    
-    # Troubleshooting
-    st.markdown("### 🔧 Troubleshooting")
-    
-    with st.expander("🚨 Common Issues & Solutions"):
-        st.markdown("""
-        **Issue**: Model not loading
-        - **Solution**: Ensure 'best.pt' file exists in the same directory
-        
-        **Issue**: Camera not working
-        - **Solution**: Allow camera permissions in browser settings
-        
-        **Issue**: Slow processing
-        - **Solution**: Reduce image size or close other applications
-        
-        **Issue**: No detections found
-        - **Solution**: Ensure good lighting and clear damage visibility
-        
-        **Issue**: Low confidence scores
-        - **Solution**: Take closer photos with better angles
-        """)
-    
-    # Version information
-    st.markdown("### 📋 Version Information")
-    
-    version_info = {
-        "Component": ["Application", "YOLO Framework", "Streamlit", "Python"],
-        "Version": ["1.0.0", "Ultralytics", "Latest", "3.8+"],
-        "Status": ["✅ Active", "✅ Loaded", "✅ Running", "✅ Compatible"]
-    }
-    version_df = pd.DataFrame(version_info)
-    st.dataframe(version_df, use_container_width=True, hide_index=True)
-    
-    # Contact and support
-    st.markdown("### 📞 Support & Contact")
-    
-    st.info("""
-    🔧 **Technical Support**: For technical issues or questions
-    📧 **Feature Requests**: Suggestions for new features
-    🐛 **Bug Reports**: Report any issues encountered
-    📚 **Documentation**: Additional user guides and tutorials
-    """)
-    
-    # Credits and acknowledgments
-    st.markdown("### 🙏 Credits & Acknowledgments")
-    
-    st.markdown("""
-    - **YOLO**: Ultralytics team for the excellent YOLO framework
-    - **Streamlit**: For the amazing web application framework
-    - **OpenCV**: Computer vision processing capabilities
-    - **PIL/Pillow**: Image processing and manipulation
-    - **Pandas**: Data analysis and manipulation tools
-    """)
-
-# ==========================
-# FOOTER
-# ==========================
-st.divider()
-
-footer_col1, footer_col2, footer_col3 = st.columns(3)
-
-with footer_col1:
-    st.caption("🛠️ Car Damage Detection System v1.0")
-
-with footer_col2:
-    st.caption("📸 Clean Professional Annotations")
-
-with footer_col3:
-    st.caption(f"🕐 Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-# ==========================
-# ADDITIONAL STYLING (Optional)
-# ==========================
-st.markdown("""
-<style>
-    .stApp {
-        max-width: 1200px;
-        margin: 0 auto;
-    }
-    
-    .metric-container {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
-    }
-    
-    .success-message {
-        background-color: #d4edda;
-        color: #155724;
-        padding: 0.75rem;
-        border-radius: 0.25rem;
-        border: 1px solid #c3e6cb;
-        margin: 0.5rem 0;
-    }
-    
-    .info-message {
-        background-color: #d1ecf1;
-        color: #0c5460;
-        padding: 0.75rem;
-        border-radius: 0.25rem;
-        border: 1px solid #bee5eb;
-        margin: 0.5rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)# ==========================
-def run_inference_simple(model, image):
-    try:
-        # Run prediction
-        results = model.predict(
-            source=image,
-            conf=FIXED_CONF,
-            iou=FIXED_IOU,
-            imgsz=FIXED_IMGSZ,
-            verbose=False
-        )
-        
-        r = results[0]
-        detections = []
-        
-        # Get annotated image
-        annotated = r.plot()  # This returns BGR
-        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        
-        # Extract detections
-        if hasattr(r, 'boxes') and r.boxes is not None and len(r.boxes) > 0:
-            boxes = r.boxes.xyxy.cpu().numpy()
-            classes = r.boxes.cls.cpu().numpy().astype(int)
-            confs = r.boxes.conf.cpu().numpy()
-            names = r.names
-            
-            for box, cls_id, conf in zip(boxes, classes, confs):
-                cls_name = names.get(cls_id, str(cls_id))
-                
-                # Simple severity
-                bbox_area = (box[2] - box[0]) * (box[3] - box[1])
-                if bbox_area < 5000:
-                    severity = "Light"
-                elif bbox_area < 15000:
-                    severity = "Medium"
-                else:
-                    severity = "Heavy"
-                
-                detections.append({
-                    "class_name": cls_name,
-                    "confidence": float(conf),
-                    "severity": severity,
-                    "timestamp": datetime.now().strftime("%H:%M:%S")
-                })
-        
-        return annotated_rgb, detections
-        
-    except Exception as e:
-        return image, []
-
-# ==========================
-# MAIN APP
-# ==========================
-st.title("🚗 Car Damage Detection System")
-
-# Load model
-model = load_model()
-if model is None:
-    st.error("❌ Model tidak tersedia! Pastikan file 'best.pt' ada.")
-    st.stop()
-
-st.success(f"✅ Model loaded: {WEIGHTS_FILE}")
-
-# ==========================
-# TABS
-# ==========================
-tab1, tab2, tab3 = st.tabs(["📷 Camera Capture", "📁 Upload Images", "📊 Results"])
-
-# ==========================
-# TAB 1: CAMERA CAPTURE (Simple approach)
-# ==========================
-with tab1:
-    st.header("📷 Camera Capture")
-    st.markdown("Ambil foto menggunakan kamera untuk deteksi kerusakan mobil.")
-    
-    # Camera input using streamlit's built-in camera
-    camera_image = st.camera_input("Ambil foto mobil")
-    
-    col1, col2 = st.columns(2)
-    
-    if camera_image is not None:
-        # Convert to PIL Image
-        image = Image.open(camera_image).convert('RGB')
-        
-        with col1:
-            st.image(image, caption="Original Image", use_container_width=True)
-        
-        # Process button
-        if st.button("🔍 Analyze Damage", type="primary", use_container_width=True):
-            with st.spinner("Analyzing image..."):
-                annotated_img, detections = run_inference_simple(model, image)
-                
-                with col2:
-                    st.image(annotated_img, caption="Detection Results", use_container_width=True)
-                
-                # Show results
-                if detections:
-                    st.success(f"✅ Found {len(detections)} damage(s)!")
-                    
-                    # Add to results
-                    st.session_state.detection_results.extend(detections)
-                    
-                    # Display detections
-                    for i, det in enumerate(detections, 1):
-                        severity_emoji = {"Light": "🟢", "Medium": "🟡", "Heavy": "🔴"}.get(det['severity'], "⚪")
-                        st.write(f"{severity_emoji} **{det['class_name']}** - {det['severity']} ({det['confidence']:.2%})")
-                        
-                else:
-                    st.info("✅ No damage detected!")
-
-# ==========================
-# TAB 2: UPLOAD IMAGES
-# ==========================
-with tab2:
-    st.header("📁 Upload Images")
-    st.markdown("Upload gambar mobil untuk deteksi kerusakan batch.")
-    
-    # File uploader
-    uploaded_files = st.file_uploader(
-        "Pilih gambar mobil",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True
-    )
-    
-    if uploaded_files:
-        st.write(f"📁 {len(uploaded_files)} file(s) uploaded")
-        
-        # Process all button
-        if st.button("🚀 Process All Images", type="primary", use_container_width=True):
-            progress_bar = st.progress(0)
-            
-            for idx, uploaded_file in enumerate(uploaded_files):
-                st.subheader(f"Processing: {uploaded_file.name}")
-                
-                # Load image
-                image = Image.open(uploaded_file).convert('RGB')
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.image(image, caption="Original", use_container_width=True)
-                
-                # Process
-                with st.spinner(f"Analyzing {uploaded_file.name}..."):
-                    annotated_img, detections = run_inference_simple(model, image)
-                
-                with col2:
-                    st.image(annotated_img, caption="Detection", use_container_width=True)
-                
-                # Results
-                if detections:
-                    st.success(f"Found {len(detections)} damage(s) in {uploaded_file.name}")
-                    
-                    # Add filename to detections
-                    for det in detections:
-                        det['filename'] = uploaded_file.name
-                    
-                    st.session_state.detection_results.extend(detections)
-                    
-                    for det in detections:
-                        severity_emoji = {"Light": "🟢", "Medium": "🟡", "Heavy": "🔴"}.get(det['severity'], "⚪")
-                        st.write(f"{severity_emoji} **{det['class_name']}** - {det['severity']}")
-                else:
-                    st.info(f"No damage detected in {uploaded_file.name}")
-                
-                # Update progress
-                progress_bar.progress((idx + 1) / len(uploaded_files))
-                st.divider()
-            
-            progress_bar.empty()
-            st.success("🎉 All images processed!")
-
-# ==========================
-# TAB 3: RESULTS
-# ==========================
-with tab3:
-    st.header("📊 Detection Results")
-    
-    if st.session_state.detection_results:
-        df = pd.DataFrame(st.session_state.detection_results)
-        
-        # Summary metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Detections", len(df))
-        
-        with col2:
-            unique_classes = df['class_name'].nunique()
-            st.metric("Damage Types", unique_classes)
-        
-        with col3:
-            avg_conf = df['confidence'].mean()
-            st.metric("Avg Confidence", f"{avg_conf:.1%}")
-        
-        with col4:
-            heavy_count = len(df[df['severity'] == 'Heavy'])
-            st.metric("🔴 Heavy Damage", heavy_count)
-        
-        # Charts
-        st.subheader("📈 Analysis")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.write("**Damage Types**")
-            damage_counts = df['class_name'].value_counts()
-            st.bar_chart(damage_counts)
-        
-        with col2:
-            st.write("**Severity Distribution**")
-            severity_counts = df['severity'].value_counts()
-            st.bar_chart(severity_counts)
-        
-        # Data table
-        st.subheader("📋 Detailed Results")
-        st.dataframe(df, use_container_width=True)
-        
-        # Export
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            csv_data = df.to_csv(index=False)
-            st.download_button(
-                "📥 Download CSV",
-                csv_data,
-                f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv",
-                use_container_width=True
-            )
-        
-        with col2:
-            if st.button("🗑️ Clear All Results", use_container_width=True):
-                st.session_state.detection_results = []
-                st.success("Results cleared!")
-                st.rerun()
-    
-    else:
-        st.info("🔍 No detection results yet. Use Camera Capture or Upload Images to start!")
-
-# ==========================
-# SIDEBAR INFO
-# ==========================
-with st.sidebar:
-    st.header("ℹ️ Information")
-    
-    st.markdown("""
-    **How to use:**
-    1. **Camera**: Take photo with built-in camera
-    2. **Upload**: Process multiple images
-    3. **Results**: View analysis and export data
-    
-    **Severity Levels:**
-    - 🟢 Light: Minor damage
-    - 🟡 Medium: Moderate damage
-    - 🔴 Heavy: Severe damage
-    """)
-    
-    st.markdown("---")
-    st.caption("🚗 Car Damage Detection")
-    st.caption("📸 No WebRTC - Simple & Reliable")
-
-# ==========================
-# FOOTER
-# ==========================
-st.divider()
-st.caption("🛠️ Simple car damage detection without complex streaming")
-st.caption("📱 Works on all devices and networks")
+            # Summary
