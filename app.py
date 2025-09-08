@@ -28,7 +28,7 @@ st.set_page_config(page_title="Car Damage Detection (Streaming)", page_icon="�
 st.title("🚗 Car Damage Detection — Live Streaming with Segmentation")
 
 WEIGHTS_FILE = "best.pt"          # taruh model di root app
-CONF_THRES   = 0.15
+CONF_THRES   = 0.10
 IOU_THRES    = 0.7
 IMG_SIZE     = 416
 
