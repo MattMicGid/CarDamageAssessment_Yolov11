@@ -1061,4 +1061,3 @@ with tab3:
                 st.button("📊 Download Filtered", disabled=True, use_container_width=True)
         
         with col_export3:
-            # Summary
