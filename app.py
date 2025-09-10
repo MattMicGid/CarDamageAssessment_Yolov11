@@ -24,7 +24,7 @@ st.set_page_config(
 # ==========================
 # INFERENCE CONSTANTS (ubah di sini saja)
 # ==========================
-CONF_THRES = 0.25      # confidence threshold
+CONF_THRES = 0.15      # confidence threshold
 IOU_THRES  = 0.45      # NMS IoU threshold
 IMG_SIZE   = 640       # inference image size
 MAX_DET    = 300       # max detections per image
