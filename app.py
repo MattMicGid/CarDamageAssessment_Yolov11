@@ -183,7 +183,7 @@ def process_image_segmentation(model, image: Image.Image):
             x1, y1, x2, y2 = map(int, xyxy[i])
             cv2.rectangle(draw, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
-                draw, f"{label_name} {conf[i]:.2f}",
+                draw, f"{label_name}",
                 (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
             )
 
@@ -317,7 +317,7 @@ def show_input_step():
             img = Image.open(f).convert("RGB")
             st.session_state.uploaded_images.append({'name': f.name, 'image': img})
             with cols[i % 3]:
-                st.image(img, caption=f.name, use_column_width=True)
+                st.image(img, caption=f.name, use_container_width=True)
         st.success(f"✅ {len(files)} gambar telah diupload")
 
     st.markdown("---")
@@ -434,8 +434,8 @@ def show_results_step():
         for img in car['images']:
             st.write(f"**📸 {img['name']}**")
             a,b = st.columns(2)
-            with a: st.image(img['original'], caption="Gambar Asli", use_column_width=True)
-            with b: st.image(img['annotated'], caption="Hasil Deteksi dengan Mask", use_column_width=True)
+            with a: st.image(img['original'], caption="Gambar Asli", use_container_width=True)
+            with b: st.image(img['annotated'], caption="Hasil Deteksi dengan Mask", use_container_width=True)
 
             if sum(img['damages'].values())>0:
                 st.write("**Kerusakan pada gambar ini:**")
@@ -511,7 +511,7 @@ def show_detailed_output():
                 'Total_in_Image': sum(img['damages'].values()),
                 'Car_Severity': car['severity'][0]
             })
-    st.dataframe(pd.DataFrame(rows), use_column_width=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 # ==========================
 # ENTRY POINT
