@@ -77,7 +77,7 @@ def process_single_image(model, image, car_id=""):
         img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
     
     # Prediksi menggunakan model
-    results = model(img_array)
+    results = results = model(img_array, conf=0.15, iou=0.6)
     
     # Inisialisasi hitungan kerusakan
     damage_counts = {damage: 0 for damage in DAMAGE_CLASSES.values()}
