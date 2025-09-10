@@ -132,7 +132,7 @@ def get_damage_severity(damage_counts):
     else:
         return "Heavy", "error"
 
-def process_image_segmentation(model, image, conf_threshold=0.5):
+def process_image_segmentation(model, image, conf_threshold=0.1):
     """Process single image for damage detection with instance segmentation"""
     # Convert PIL to numpy array
     img_array = np.array(image)
