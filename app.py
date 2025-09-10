@@ -25,56 +25,98 @@ st.markdown("""
 .main-header {
     background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
     color: white;
-    padding: 1rem;
-    border-radius: 10px;
+    padding: 1.5rem;
+    border-radius: 15px;
     text-align: center;
     margin-bottom: 2rem;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
 }
 
-.damage-card {
-    background: #f8f9fa;
-    border: 1px solid #e9ecef;
-    border-radius: 8px;
-    padding: 1rem;
-    margin: 0.5rem 0;
-}
-
-.severity-light { border-left: 5px solid #28a745; }
-.severity-medium { border-left: 5px solid #ffc107; }
-.severity-heavy { border-left: 5px solid #dc3545; }
-
-.metric-card {
+.step-card {
     background: white;
-    border-radius: 10px;
-    padding: 1rem;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    border: 2px solid #e9ecef;
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin: 1rem 0;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.active-step {
+    border-color: #667eea;
+    background: linear-gradient(135deg, #f8f9ff 0%, #e3f2fd 100%);
 }
 
 .queue-item {
-    background: #e3f2fd;
-    border-radius: 8px;
+    background: #e8f5e8;
+    border-radius: 10px;
     padding: 1rem;
     margin: 0.5rem 0;
-    border-left: 4px solid #2196f3;
+    border-left: 4px solid #28a745;
+}
+
+.processing-item {
+    background: #fff3cd;
+    border-left: 4px solid #ffc107;
+}
+
+.completed-item {
+    background: #d1ecf1;
+    border-left: 4px solid #17a2b8;
+}
+
+.damage-mask {
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 0.5rem 0;
+}
+
+.severity-light { 
+    background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
+    color: #155724;
+    padding: 0.5rem;
+    border-radius: 8px;
+    border-left: 4px solid #28a745;
+}
+
+.severity-medium { 
+    background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%);
+    color: #856404;
+    padding: 0.5rem;
+    border-radius: 8px;
+    border-left: 4px solid #ffc107;
+}
+
+.severity-heavy { 
+    background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
+    color: #721c24;
+    padding: 0.5rem;
+    border-radius: 8px;
+    border-left: 4px solid #dc3545;
 }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialize session state
+if 'current_step' not in st.session_state:
+    st.session_state.current_step = 'dashboard'
 if 'car_queue' not in st.session_state:
     st.session_state.car_queue = []
 if 'processed_results' not in st.session_state:
     st.session_state.processed_results = []
+if 'current_license_plate' not in st.session_state:
+    st.session_state.current_license_plate = ""
+if 'uploaded_images' not in st.session_state:
+    st.session_state.uploaded_images = []
 
 @st.cache_resource
 def load_model():
-    """Load YOLOv11 model"""
+    """Load YOLOv11 segmentation model"""
     try:
         model = YOLO('best.pt')
         return model
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        st.info("Make sure 'best.pt' model file is in the root directory")
+        st.error(f"❌ Error loading model: {str(e)}")
+        st.info("📁 Make sure 'best.pt' model file is in the root directory")
         return None
 
 def get_damage_severity(damage_counts):
@@ -90,12 +132,12 @@ def get_damage_severity(damage_counts):
     else:
         return "Heavy", "error"
 
-def process_image(model, image, conf_threshold=0.5):
-    """Process single image for damage detection"""
+def process_image_segmentation(model, image, conf_threshold=0.5):
+    """Process single image for damage detection with instance segmentation"""
     # Convert PIL to numpy array
     img_array = np.array(image)
     
-    # Run inference
+    # Run inference with segmentation
     results = model(img_array, conf=conf_threshold)
     
     # Extract damage information
@@ -108,28 +150,32 @@ def process_image(model, image, conf_threshold=0.5):
         'tire_damage': 0
     }
     
-    # Create annotated image
+    # Create annotated image with masks
     annotated_img = image.copy()
-    draw = ImageDraw.Draw(annotated_img)
+    img_array_draw = np.array(annotated_img)
     
-    # Color mapping for different damage types
+    # Color mapping for different damage types (RGB format)
     color_map = {
-        'dent': '#FF6B6B',
-        'scratch': '#4ECDC4', 
-        'crack': '#45B7D1',
-        'glass_damage': '#96CEB4',
-        'lamp_damage': '#FFEAA7',
-        'tire_damage': '#DDA0DD'
+        'dent': (255, 107, 107),      # Red
+        'scratch': (78, 205, 196),     # Teal  
+        'crack': (69, 183, 209),       # Blue
+        'glass_damage': (150, 206, 180), # Green
+        'lamp_damage': (255, 234, 167),  # Yellow
+        'tire_damage': (221, 160, 221)   # Purple
     }
+    
+    # Transparency for masks
+    alpha = 0.4
     
     if results and len(results) > 0:
         for result in results:
-            if result.boxes is not None:
+            if result.boxes is not None and result.masks is not None:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 classes = result.boxes.cls.cpu().numpy()
                 confidences = result.boxes.conf.cpu().numpy()
+                masks = result.masks.data.cpu().numpy()
                 
-                for box, cls, conf in zip(boxes, classes, confidences):
+                for box, cls, conf, mask in zip(boxes, classes, confidences, masks):
                     if conf >= conf_threshold:
                         # Map class to damage type (adjust based on your model classes)
                         class_names = model.names
@@ -139,14 +185,35 @@ def process_image(model, image, conf_threshold=0.5):
                         if damage_type in damage_info:
                             damage_info[damage_type] += 1
                         
+                        # Get color for this damage type
+                        color = color_map.get(damage_type, (255, 0, 0))
+                        
+                        # Apply mask overlay
+                        mask_resized = cv2.resize(mask, (img_array_draw.shape[1], img_array_draw.shape[0]))
+                        mask_binary = mask_resized > 0.5
+                        
+                        # Create colored mask
+                        colored_mask = np.zeros_like(img_array_draw)
+                        colored_mask[mask_binary] = color
+                        
+                        # Blend with original image
+                        img_array_draw = cv2.addWeighted(
+                            img_array_draw, 1-alpha,
+                            colored_mask, alpha,
+                            0
+                        )
+                        
                         # Draw bounding box
                         x1, y1, x2, y2 = map(int, box)
-                        color = color_map.get(damage_type, '#FF0000')
-                        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+                        cv2.rectangle(img_array_draw, (x1, y1), (x2, y2), color, 2)
                         
                         # Add label
                         label = f"{damage_type}: {conf:.2f}"
-                        draw.text((x1, y1-20), label, fill=color)
+                        cv2.putText(img_array_draw, label, (x1, y1-10), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    
+    # Convert back to PIL
+    annotated_img = Image.fromarray(img_array_draw)
     
     return annotated_img, damage_info
 
@@ -155,7 +222,6 @@ def create_summary_report(car_data):
     df_data = []
     for car in car_data:
         row = {
-            'Car_ID': car['id'],
             'License_Plate': car['plate'],
             'Total_Images': len(car['images']),
             'Dent': car['total_damages']['dent'],
@@ -177,7 +243,7 @@ def main():
     st.markdown("""
     <div class="main-header">
         <h1>🚗 Car Damage Assessment System</h1>
-        <p>Advanced AI-powered vehicle damage detection using YOLOv11</p>
+        <p>AI-powered vehicle damage detection using YOLOv11 Instance Segmentation</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -186,229 +252,245 @@ def main():
     if not model:
         st.stop()
     
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ System Settings")
-        
-        mode = st.selectbox(
-            "Select Mode:",
-            ["🏠 Single Car Analysis", "🏢 Batch Processing", "📊 View Results"]
-        )
-        
-        st.markdown("---")
-        st.markdown("### 📋 Processing Queue")
-        
-        if st.session_state.car_queue:
-            for i, car in enumerate(st.session_state.car_queue):
-                st.markdown(f"""
-                <div class="queue-item">
-                    <strong>{car['id']}</strong><br>
-                    Plate: {car['plate']}<br>
-                    Images: {len(car['images'])}
-                </div>
-                """, unsafe_allow_html=True)
-                
-                if st.button(f"❌ Remove {car['id']}", key=f"remove_{i}"):
-                    st.session_state.car_queue.pop(i)
-                    st.rerun()
+    # Flow control based on current step
+    if st.session_state.current_step == 'dashboard':
+        show_dashboard()
+    elif st.session_state.current_step == 'input':
+        show_input_step(model)
+    elif st.session_state.current_step == 'queue':
+        show_queue_step()
+    elif st.session_state.current_step == 'process':
+        show_process_step(model)
+    elif st.session_state.current_step == 'results':
+        show_results_step()
+    elif st.session_state.current_step == 'download':
+        show_download_step()
+
+def show_dashboard():
+    """Dashboard - Starting point"""
+    st.markdown("""
+    <div class="step-card active-step">
+        <h2>📊 Halaman Dashboard</h2>
+        <p>Selamat datang di sistem identifikasi kerusakan mobil menggunakan AI</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Statistics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("🚗 Cars in Queue", len(st.session_state.car_queue))
+    with col2:
+        total_processed = len(st.session_state.processed_results)
+        st.metric("✅ Cars Processed", total_processed)
+    with col3:
+        if st.session_state.processed_results:
+            total_damages = sum(sum(car['total_damages'].values()) for car in st.session_state.processed_results)
+            st.metric("🔍 Total Damages Found", total_damages)
         else:
-            st.info("Queue is empty")
-        
-        if st.session_state.car_queue:
-            st.markdown("---")
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🚀 Process All"):
-                    process_queue(model)
-            with col2:
-                if st.button("🗑️ Clear Queue"):
-                    st.session_state.car_queue = []
-                    st.rerun()
+            st.metric("🔍 Total Damages Found", 0)
+    with col4:
+        if st.session_state.processed_results:
+            heavy_damage = sum(1 for car in st.session_state.processed_results if car['severity'][0] == 'Heavy')
+            st.metric("⚠️ Heavy Damage Cars", heavy_damage)
+        else:
+            st.metric("⚠️ Heavy Damage Cars", 0)
     
-    # Main content based on mode
-    if mode == "🏠 Single Car Analysis":
-        single_car_mode(model)
-    elif mode == "🏢 Batch Processing":
-        batch_processing_mode(model)
-    else:
-        view_results_mode()
+    st.markdown("---")
+    
+    # Recent activity
+    if st.session_state.processed_results:
+        st.subheader("📈 Recent Processing Results")
+        for car in st.session_state.processed_results[-3:]:  # Show last 3
+            severity_class = f"severity-{car['severity'][0].lower()}"
+            st.markdown(f"""
+            <div class="completed-item {severity_class}">
+                <strong>🚗 {car['plate'] or 'Unknown Plate'}</strong><br>
+                Severity: {car['severity'][0]} | Total Damages: {sum(car['total_damages'].values())}
+            </div>
+            """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # Start button
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("🚀 Mulai Identifikasi Kerusakan", use_container_width=True, type="primary"):
+            st.session_state.current_step = 'input'
+            st.rerun()
 
-def single_car_mode(model):
-    st.header("🏠 Single Car Analysis")
+def show_input_step(model):
+    """Input Nomor Plat & Gambar"""
+    st.markdown("""
+    <div class="step-card active-step">
+        <h2>📝 Input Nomor Plat & Gambar</h2>
+        <p>Masukkan nomor plat dan upload gambar mobil untuk dianalisis</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    tab1, tab2 = st.tabs(["📤 Upload Images", "📷 Camera Capture"])
+    # Navigation
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("⬅️ Back to Dashboard"):
+            st.session_state.current_step = 'dashboard'
+            st.rerun()
     
-    with tab1:
-        st.subheader("Upload Car Images")
+    # Input form
+    st.subheader("🚗 Detail Kendaraan")
+    
+    license_plate = st.text_input(
+        "Nomor Plat Kendaraan", 
+        value=st.session_state.current_license_plate,
+        placeholder="Contoh: B 1234 CD"
+    )
+    st.session_state.current_license_plate = license_plate
+    
+    st.subheader("📸 Upload Gambar")
+    uploaded_files = st.file_uploader(
+        "Pilih gambar kendaraan (bisa multiple)", 
+        type=['png', 'jpg', 'jpeg'],
+        accept_multiple_files=True,
+        help="Upload beberapa foto dari berbagai sudut untuk hasil yang lebih akurat"
+    )
+    
+    if uploaded_files:
+        st.session_state.uploaded_images = []
         
-        col1, col2 = st.columns(2)
-        with col1:
-            car_id = st.text_input("Car ID", value=f"CAR_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        with col2:
-            license_plate = st.text_input("License Plate", value="")
+        # Preview images
+        st.subheader("👀 Preview Gambar")
+        cols = st.columns(min(len(uploaded_files), 3))
         
-        uploaded_files = st.file_uploader(
-            "Choose car images", 
-            type=['png', 'jpg', 'jpeg'],
-            accept_multiple_files=True
-        )
-        
-        if uploaded_files and car_id:
-            images = []
-            for file in uploaded_files:
-                image = Image.open(file)
-                images.append({'name': file.name, 'image': image})
+        for i, file in enumerate(uploaded_files):
+            image = Image.open(file)
+            st.session_state.uploaded_images.append({
+                'name': file.name,
+                'image': image
+            })
             
-            if st.button("🔍 Analyze Car"):
-                analyze_single_car(model, car_id, license_plate, images)
-    
-    with tab2:
-        st.subheader("Camera Capture")
-        st.info("📱 Camera capture feature would be implemented for real-time scanning")
-        st.code("""
-        # Camera capture implementation would go here
-        # Using streamlit-webrtc or similar library
-        camera_input = st.camera_input("Take a photo")
-        if camera_input:
-            # Process camera image
-            pass
-        """)
-
-def batch_processing_mode(model):
-    st.header("🏢 Batch Processing Mode")
-    
-    tab1, tab2 = st.tabs(["➕ Add Cars", "📦 ZIP Upload"])
-    
-    with tab1:
-        st.subheader("Add Individual Cars to Queue")
+            with cols[i % 3]:
+                st.image(image, caption=file.name, use_column_width=True)
         
-        col1, col2 = st.columns(2)
-        with col1:
-            car_id = st.text_input("Car ID", value=f"CAR_{len(st.session_state.car_queue)+1:03d}")
-        with col2:
-            license_plate = st.text_input("License Plate")
-        
-        uploaded_files = st.file_uploader(
-            "Upload car images",
-            type=['png', 'jpg', 'jpeg'],
-            accept_multiple_files=True,
-            key="batch_upload"
-        )
-        
-        if st.button("➕ Add to Queue") and uploaded_files:
-            images = []
-            for file in uploaded_files:
-                image = Image.open(file)
-                images.append({'name': file.name, 'image': image})
-            
+        st.success(f"✅ {len(uploaded_files)} gambar telah diupload")
+    
+    # Next button
+    st.markdown("---")
+    col1, col2, col3 = st.columns([2, 2, 1])
+    
+    with col2:
+        can_proceed = license_plate.strip() and st.session_state.uploaded_images
+        if st.button("➡️ Tambah ke Queue", disabled=not can_proceed, use_container_width=True):
+            # Add to queue
             car_data = {
-                'id': car_id,
-                'plate': license_plate,
-                'images': images
+                'plate': license_plate.strip(),
+                'images': st.session_state.uploaded_images.copy(),
+                'timestamp': datetime.now()
             }
             
             st.session_state.car_queue.append(car_data)
-            st.success(f"✅ Added {car_id} to queue with {len(images)} images")
+            
+            # Reset inputs
+            st.session_state.current_license_plate = ""
+            st.session_state.uploaded_images = []
+            
+            # Move to queue step
+            st.session_state.current_step = 'queue'
+            st.rerun()
+
+def show_queue_step():
+    """Tampilkan Queue dan opsi untuk proses"""
+    st.markdown("""
+    <div class="step-card active-step">
+        <h2>📋 Tambah Queue</h2>
+        <p>Kelola antrian kendaraan yang akan diproses</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Navigation
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("⬅️ Back to Input"):
+            st.session_state.current_step = 'input'
             st.rerun()
     
-    with tab2:
-        st.subheader("Upload ZIP File")
-        st.info("📦 Upload a ZIP file containing folders of car images")
+    # Show queue
+    if st.session_state.car_queue:
+        st.subheader(f"🚗 Antrian Kendaraan ({len(st.session_state.car_queue)} mobil)")
         
-        zip_file = st.file_uploader("Upload ZIP file", type=['zip'])
-        
-        if zip_file:
-            if st.button("📦 Extract and Add to Queue"):
-                extract_zip_to_queue(zip_file)
-
-def analyze_single_car(model, car_id, license_plate, images):
-    """Analyze a single car"""
-    st.subheader(f"🔍 Analyzing {car_id}")
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total_damages = {
-        'dent': 0, 'scratch': 0, 'crack': 0,
-        'glass_damage': 0, 'lamp_damage': 0, 'tire_damage': 0
-    }
-    
-    results_container = st.container()
-    
-    for i, img_data in enumerate(images):
-        status_text.text(f"Processing image {i+1}/{len(images)}: {img_data['name']}")
-        
-        # Process image
-        annotated_img, damage_info = process_image(model, img_data['image'])
-        
-        # Update total damages
-        for damage_type, count in damage_info.items():
-            total_damages[damage_type] += count
-        
-        # Display result
-        with results_container:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.image(img_data['image'], caption=f"Original: {img_data['name']}", use_column_width=True)
-            with col2:
-                st.image(annotated_img, caption=f"Detected: {img_data['name']}", use_column_width=True)
+        for i, car in enumerate(st.session_state.car_queue):
+            st.markdown(f"""
+            <div class="queue-item">
+                <strong>🚗 {car['plate']}</strong><br>
+                📸 {len(car['images'])} gambar | 
+                🕐 {car['timestamp'].strftime('%H:%M:%S')}
+            </div>
+            """, unsafe_allow_html=True)
             
-            # Show damage info for this image
-            if sum(damage_info.values()) > 0:
-                st.write("**Damages detected in this image:**")
-                damage_cols = st.columns(6)
-                for j, (damage_type, count) in enumerate(damage_info.items()):
-                    if count > 0:
-                        damage_cols[j % 6].metric(damage_type.replace('_', ' ').title(), count)
+            col1, col2 = st.columns([4, 1])
+            with col2:
+                if st.button(f"❌ Remove", key=f"remove_{i}"):
+                    st.session_state.car_queue.pop(i)
+                    st.rerun()
         
-        progress_bar.progress((i + 1) / len(images))
+        # Action buttons
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("➕ Tambah Mobil Lain", use_container_width=True):
+                st.session_state.current_step = 'input'
+                st.rerun()
+        
+        with col2:
+            if st.button("🚀 Proses Semua", use_container_width=True, type="primary"):
+                st.session_state.current_step = 'process'
+                st.rerun()
+        
+        with col3:
+            if st.button("🗑️ Kosongkan Queue", use_container_width=True):
+                st.session_state.car_queue = []
+                st.rerun()
     
-    # Final summary
-    severity, severity_type = get_damage_severity(total_damages)
-    
-    st.markdown("---")
-    st.subheader("📊 Analysis Summary")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Car ID", car_id)
-        st.metric("License Plate", license_plate or "N/A")
-        st.metric("Total Images", len(images))
-    
-    with col2:
-        st.metric("Total Damages", sum(total_damages.values()))
-        if severity_type == "success":
-            st.success(f"Severity: {severity}")
-        elif severity_type == "warning":
-            st.warning(f"Severity: {severity}")
-        else:
-            st.error(f"Severity: {severity}")
-    
-    with col3:
-        st.write("**Damage Breakdown:**")
-        for damage_type, count in total_damages.items():
-            if count > 0:
-                st.write(f"• {damage_type.replace('_', ' ').title()}: {count}")
-    
-    status_text.text("✅ Analysis completed!")
+    else:
+        st.info("📭 Queue kosong. Tambahkan mobil terlebih dahulu.")
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("➕ Tambah Mobil Pertama", use_container_width=True):
+                st.session_state.current_step = 'input'
+                st.rerun()
 
-def process_queue(model):
-    """Process all cars in the queue"""
+def show_process_step(model):
+    """Process all cars in queue"""
+    st.markdown("""
+    <div class="step-card active-step">
+        <h2>⚙️ Proses Semua</h2>
+        <p>Sedang memproses semua kendaraan dalam antrian...</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
     if not st.session_state.car_queue:
-        st.warning("Queue is empty!")
+        st.error("❌ Queue kosong!")
+        if st.button("⬅️ Kembali ke Dashboard"):
+            st.session_state.current_step = 'dashboard'
+            st.rerun()
         return
     
-    st.header("🚀 Processing Queue")
+    # Processing
+    progress_container = st.container()
+    results_container = st.container()
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    with progress_container:
+        st.subheader("🔄 Status Processing")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
     
     processed_cars = []
+    total_cars = len(st.session_state.car_queue)
     
     for i, car_data in enumerate(st.session_state.car_queue):
-        status_text.text(f"Processing {car_data['id']}...")
+        status_text.text(f"🔍 Processing {car_data['plate']} ({i+1}/{total_cars})...")
         
+        # Initialize damage tracking
         total_damages = {
             'dent': 0, 'scratch': 0, 'crack': 0,
             'glass_damage': 0, 'lamp_damage': 0, 'tire_damage': 0
@@ -416,10 +498,15 @@ def process_queue(model):
         
         processed_images = []
         
-        # Process each image for this car
-        for img_data in car_data['images']:
-            annotated_img, damage_info = process_image(model, img_data['image'])
+        # Process each image
+        for j, img_data in enumerate(car_data['images']):
+            sub_status = f"🔍 Processing {car_data['plate']} - Image {j+1}/{len(car_data['images'])}"
+            status_text.text(sub_status)
             
+            # Run segmentation
+            annotated_img, damage_info = process_image_segmentation(model, img_data['image'])
+            
+            # Update total damages
             for damage_type, count in damage_info.items():
                 total_damages[damage_type] += count
             
@@ -430,154 +517,231 @@ def process_queue(model):
                 'damages': damage_info
             })
         
+        # Calculate severity
         severity = get_damage_severity(total_damages)
         
         processed_car = {
-            'id': car_data['id'],
             'plate': car_data['plate'],
             'images': processed_images,
             'total_damages': total_damages,
-            'severity': severity
+            'severity': severity,
+            'processed_time': datetime.now()
         }
         
         processed_cars.append(processed_car)
-        progress_bar.progress((i + 1) / len(st.session_state.car_queue))
+        
+        # Update progress
+        progress_bar.progress((i + 1) / total_cars)
+        
+        # Show intermediate results
+        with results_container:
+            severity_class = f"severity-{severity[0].lower()}"
+            st.markdown(f"""
+            <div class="processing-item {severity_class}">
+                <strong>✅ {car_data['plate']}</strong> - {severity[0]} damage<br>
+                Total kerusakan ditemukan: {sum(total_damages.values())}
+            </div>
+            """, unsafe_allow_html=True)
     
-    # Save results
+    # Save results and clear queue
     st.session_state.processed_results = processed_cars
-    st.session_state.car_queue = []  # Clear queue after processing
+    st.session_state.car_queue = []
     
-    status_text.text("✅ All cars processed successfully!")
-    st.success(f"Processed {len(processed_cars)} cars successfully!")
+    status_text.text("✅ Semua kendaraan berhasil diproses!")
     
-    # Show summary
-    show_batch_summary(processed_cars)
+    st.success(f"🎉 Berhasil memproses {total_cars} kendaraan!")
+    
+    # Auto-proceed to results after 2 seconds
+    import time
+    time.sleep(2)
+    st.session_state.current_step = 'results'
+    st.rerun()
 
-def show_batch_summary(processed_cars):
-    """Show batch processing summary"""
-    st.subheader("📊 Batch Processing Summary")
+def show_results_step():
+    """Display processing results with masks side by side"""
+    st.markdown("""
+    <div class="step-card active-step">
+        <h2>📊 Tampilkan Mask Side by Side</h2>
+        <p>Hasil analisis kerusakan dengan segmentasi mask</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Create summary DataFrame
-    summary_df = create_summary_report(processed_cars)
+    if not st.session_state.processed_results:
+        st.error("❌ Tidak ada hasil untuk ditampilkan!")
+        if st.button("⬅️ Kembali ke Dashboard"):
+            st.session_state.current_step = 'dashboard'
+            st.rerun()
+        return
     
-    # Display metrics
+    # Summary metrics
+    st.subheader("📈 Ringkasan Hasil")
+    
+    total_cars = len(st.session_state.processed_results)
+    total_damages = sum(sum(car['total_damages'].values()) for car in st.session_state.processed_results)
+    heavy_damage_cars = sum(1 for car in st.session_state.processed_results if car['severity'][0] == 'Heavy')
+    
     col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🚗 Total Mobil", total_cars)
+    col2.metric("🔍 Total Kerusakan", total_damages)
+    col3.metric("⚠️ Kerusakan Berat", heavy_damage_cars)
+    col4.metric("✅ Success Rate", "100%")
+    
+    st.markdown("---")
+    
+    # Display results for each car
+    for car_idx, car in enumerate(st.session_state.processed_results):
+        st.subheader(f"🚗 {car['plate']} - {car['severity'][0]} Damage")
+        
+        # Damage summary for this car
+        damages = car['total_damages']
+        damage_text = []
+        for damage_type, count in damages.items():
+            if count > 0:
+                damage_text.append(f"{damage_type.replace('_', ' ').title()}: {count}")
+        
+        if damage_text:
+            st.write(f"**Kerusakan ditemukan:** {', '.join(damage_text)}")
+        else:
+            st.write("**Tidak ada kerusakan ditemukan**")
+        
+        # Display images side by side
+        for img_idx, img_data in enumerate(car['images']):
+            st.write(f"**📸 {img_data['name']}**")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.image(img_data['original'], 
+                        caption="Gambar Asli", 
+                        use_column_width=True)
+            
+            with col2:
+                st.image(img_data['annotated'], 
+                        caption="Hasil Deteksi dengan Mask", 
+                        use_column_width=True)
+            
+            # Show damage details for this image
+            if sum(img_data['damages'].values()) > 0:
+                st.write("**Kerusakan pada gambar ini:**")
+                damage_cols = st.columns(6)
+                for j, (damage_type, count) in enumerate(img_data['damages'].items()):
+                    if count > 0:
+                        damage_cols[j % 6].metric(
+                            damage_type.replace('_', ' ').title(), 
+                            count
+                        )
+        
+        st.markdown("---")
+    
+    # Navigation buttons
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Total Cars", len(processed_cars))
-    with col2:
-        st.metric("Total Images", summary_df['Total_Images'].sum())
-    with col3:
-        st.metric("Total Damages", summary_df['Total_Damages'].sum())
-    with col4:
-        heavy_damage_count = (summary_df['Severity'] == 'Heavy').sum()
-        st.metric("Heavy Damage Cars", heavy_damage_count)
+        if st.button("🔄 Prediksi Lagi", use_container_width=True):
+            # Clear results and go back to dashboard
+            st.session_state.processed_results = []
+            st.session_state.current_step = 'dashboard'
+            st.rerun()
     
-    # Display summary table
+    with col2:
+        if st.button("📥 Download ZIP?", use_container_width=True, type="primary"):
+            st.session_state.current_step = 'download'
+            st.rerun()
+    
+    with col3:
+        if st.button("📊 Tampilkan Output", use_container_width=True):
+            show_detailed_output()
+
+def show_download_step():
+    """Download step - File Download"""
+    st.markdown("""
+    <div class="step-card active-step">
+        <h2>📥 File Download</h2>
+        <p>Download hasil analisis dalam berbagai format</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    if not st.session_state.processed_results:
+        st.error("❌ Tidak ada hasil untuk didownload!")
+        if st.button("⬅️ Kembali ke Dashboard"):
+            st.session_state.current_step = 'dashboard'
+            st.rerun()
+        return
+    
+    st.subheader("📊 Summary Report")
+    
+    # Create and display summary DataFrame
+    summary_df = create_summary_report(st.session_state.processed_results)
     st.dataframe(summary_df, use_container_width=True)
     
     # Download options
-    st.subheader("📥 Download Results")
-    
     col1, col2 = st.columns(2)
     
     with col1:
+        # CSV Download
         csv_data = summary_df.to_csv(index=False)
         st.download_button(
             label="📄 Download CSV Report",
             data=csv_data,
             file_name=f"car_damage_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
+            mime="text/csv",
+            use_container_width=True
         )
     
     with col2:
-        if st.button("📦 Generate ZIP with Images"):
-            zip_data = create_results_zip(processed_cars)
-            st.download_button(
-                label="📦 Download ZIP with Images",
-                data=zip_data,
-                file_name=f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip"
-            )
-
-def view_results_mode():
-    """View previously processed results"""
-    st.header("📊 View Results")
+        # ZIP Download
+        zip_data = create_results_zip(st.session_state.processed_results)
+        st.download_button(
+            label="📦 Download ZIP with Images",
+            data=zip_data,
+            file_name=f"car_damage_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
     
-    if not st.session_state.processed_results:
-        st.info("No results available. Process some cars first!")
-        return
+    st.markdown("---")
     
-    # Show summary
-    show_batch_summary(st.session_state.processed_results)
+    # Navigation
+    col1, col2 = st.columns(2)
     
-    # Individual car details
-    st.subheader("🔍 Individual Car Details")
-    
-    car_ids = [car['id'] for car in st.session_state.processed_results]
-    selected_car = st.selectbox("Select car to view details:", car_ids)
-    
-    if selected_car:
-        car_data = next(car for car in st.session_state.processed_results if car['id'] == selected_car)
-        
-        st.write(f"**Car ID:** {car_data['id']}")
-        st.write(f"**License Plate:** {car_data['plate']}")
-        st.write(f"**Severity:** {car_data['severity'][0]}")
-        
-        # Show images
-        for img_data in car_data['images']:
-            st.write(f"**Image: {img_data['name']}**")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.image(img_data['original'], caption="Original", use_column_width=True)
-            with col2:
-                st.image(img_data['annotated'], caption="Detected", use_column_width=True)
-
-def extract_zip_to_queue(zip_file):
-    """Extract ZIP file and add cars to queue"""
-    try:
-        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-            # Get all files in zip
-            file_list = zip_ref.namelist()
-            
-            # Group files by folder (assuming each folder is a car)
-            car_folders = {}
-            for file_path in file_list:
-                if file_path.endswith(('.png', '.jpg', '.jpeg')):
-                    folder = os.path.dirname(file_path)
-                    if folder not in car_folders:
-                        car_folders[folder] = []
-                    car_folders[folder].append(file_path)
-            
-            # Add each car folder to queue
-            for folder, files in car_folders.items():
-                car_id = folder.replace('/', '_') or f"ZIP_CAR_{len(st.session_state.car_queue)+1}"
-                images = []
-                
-                for file_path in files:
-                    with zip_ref.open(file_path) as img_file:
-                        image = Image.open(img_file)
-                        images.append({
-                            'name': os.path.basename(file_path),
-                            'image': image.copy()
-                        })
-                
-                car_data = {
-                    'id': car_id,
-                    'plate': '',
-                    'images': images
-                }
-                
-                st.session_state.car_queue.append(car_data)
-            
-            st.success(f"✅ Added {len(car_folders)} cars from ZIP file to queue")
+    with col1:
+        if st.button("⬅️ Kembali ke Hasil", use_container_width=True):
+            st.session_state.current_step = 'results'
             st.rerun()
-            
-    except Exception as e:
-        st.error(f"Error processing ZIP file: {str(e)}")
+    
+    with col2:
+        if st.button("🏠 Kembali ke Dashboard", use_container_width=True):
+            st.session_state.current_step = 'dashboard'
+            st.rerun()
+
+def show_detailed_output():
+    """Show detailed tabular output"""
+    st.subheader("📋 Detailed Output Table")
+    
+    # Detailed breakdown per car per image
+    detailed_data = []
+    
+    for car in st.session_state.processed_results:
+        for img in car['images']:
+            row = {
+                'License_Plate': car['plate'],
+                'Image_Name': img['name'],
+                'Dent': img['damages']['dent'],
+                'Scratch': img['damages']['scratch'],
+                'Crack': img['damages']['crack'],
+                'Glass_Damage': img['damages']['glass_damage'],
+                'Lamp_Damage': img['damages']['lamp_damage'],
+                'Tire_Damage': img['damages']['tire_damage'],
+                'Total_in_Image': sum(img['damages'].values()),
+                'Car_Severity': car['severity'][0]
+            }
+            detailed_data.append(row)
+    
+    detailed_df = pd.DataFrame(detailed_data)
+    st.dataframe(detailed_df, use_container_width=True)
 
 def create_results_zip(processed_cars):
-    """Create ZIP file with all results"""
+    """Create ZIP file with all results including masks"""
     zip_buffer = io.BytesIO()
     
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -588,7 +752,7 @@ def create_results_zip(processed_cars):
         
         # Add images for each car
         for car in processed_cars:
-            car_folder = f"{car['id']}/"
+            car_folder = f"{car['plate'].replace(' ', '_')}/"
             
             for img_data in car['images']:
                 # Save original image
@@ -596,10 +760,33 @@ def create_results_zip(processed_cars):
                 img_data['original'].save(original_buffer, format='PNG')
                 zip_file.writestr(f"{car_folder}original_{img_data['name']}", original_buffer.getvalue())
                 
-                # Save annotated image
-                annotated_buffer = io.BytesIO()
-                img_data['annotated'].save(annotated_buffer, format='PNG')
-                zip_file.writestr(f"{car_folder}detected_{img_data['name']}", annotated_buffer.getvalue())
+                # Save segmented image with masks
+                segmented_buffer = io.BytesIO()
+                img_data['annotated'].save(segmented_buffer, format='PNG')
+                zip_file.writestr(f"{car_folder}segmented_{img_data['name']}", segmented_buffer.getvalue())
+        
+        # Add detailed report per image
+        detailed_data = []
+        for car in processed_cars:
+            for img in car['images']:
+                row = {
+                    'License_Plate': car['plate'],
+                    'Image_Name': img['name'],
+                    'Dent': img['damages']['dent'],
+                    'Scratch': img['damages']['scratch'],
+                    'Crack': img['damages']['crack'],
+                    'Glass_Damage': img['damages']['glass_damage'],
+                    'Lamp_Damage': img['damages']['lamp_damage'],
+                    'Tire_Damage': img['damages']['tire_damage'],
+                    'Total_in_Image': sum(img['damages'].values()),
+                    'Car_Severity': car['severity'][0],
+                    'Processing_Time': car['processed_time'].strftime('%Y-%m-%d %H:%M:%S')
+                }
+                detailed_data.append(row)
+        
+        detailed_df = pd.DataFrame(detailed_data)
+        detailed_csv = detailed_df.to_csv(index=False)
+        zip_file.writestr("detailed_per_image_report.csv", detailed_csv)
     
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
