@@ -1,248 +1,360 @@
-# app.py
-import io
-from datetime import datetime
-from pathlib import Path
-
+import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image
-import streamlit as st
+from ultralytics import YOLO
+import tempfile
+import zipfile
+import os
+from PIL import Image, ImageDraw, ImageFont
+import io
+import base64
+from datetime import datetime
+import json
 
-# ==========================
-# APP CONFIG
-# ==========================
-st.set_page_config(page_title="Car Damage Detection (Image Capture)", page_icon="🚗", layout="wide")
-st.title("🚗 Car Damage Detection — Capture & Image Upload (Segmentation)")
+# Konfigurasi halaman
+st.set_page_config(
+    page_title="Sistem Identifikasi Kerusakan Mobil",
+    page_icon="🚗",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-WEIGHTS_FILE = "best.pt"          # taruh model di root app
-CONF_THRES   = 0.10
-IOU_THRES    = 0.7
-IMG_SIZE     = 416
-
-# ==========================
-# MODEL
-# ==========================
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except Exception:
-    YOLO_AVAILABLE = False
-
-@st.cache_resource(show_spinner=True)
-def load_model():
-    if not YOLO_AVAILABLE:
-        return None
-    if not Path(WEIGHTS_FILE).exists():
-        return None
-    m = YOLO(WEIGHTS_FILE)
-    try:
-        m.fuse()
-    except Exception:
-        pass
-    return m
-
-model = load_model()
-if model is None:
-    st.error("❌ Model tidak ditemukan/terload. Pastikan `best.pt` ada di direktori yang sama.")
-    st.stop()
-st.success(f"✅ Model loaded: {WEIGHTS_FILE}")
-
-# ==========================
-# UTIL
-# ==========================
-COLORS = {
-    "dent": (0, 114, 255),
-    "scratch": (255, 159, 0),
-    "crack": (255, 56, 56),
-    "rust": (0, 176, 80),
-    "default": (0, 153, 255),
+# Konstanta
+DAMAGE_CLASSES = {
+    0: "Dent",
+    1: "Scratch", 
+    2: "Crack",
+    3: "Glass Shatter",
+    4: "Lamp Broken",
+    5: "Tire Flat"
 }
 
-def color_for(name: str):
-    return COLORS.get(name.lower(), COLORS["default"])
+DAMAGE_COLORS = {
+    "Dent": (255, 0, 0),      # Merah
+    "Scratch": (0, 255, 0),   # Hijau
+    "Crack": (255, 255, 0),   # Kuning
+    "Glass Shatter": (255, 0, 255),  # Magenta
+    "Lamp Broken": (0, 255, 255),    # Cyan
+    "Tire Flat": (128, 0, 128)       # Ungu
+}
 
-def put_label(img, text, x, y):
-    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-    cv2.rectangle(img, (x, y - h - 8), (x + w + 8, y), color=(0, 0, 0), thickness=-1)
-    cv2.putText(img, text, (x + 4, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+@st.cache_resource
+def load_model():
+    """Load YOLOv11 model"""
+    try:
+        model = YOLO('best.pt')
+        return model
+    except Exception as e:
+        st.error(f"Gagal memuat model: {e}")
+        return None
 
-def severity_from_bbox(box):
-    x1, y1, x2, y2 = box
-    area = float(max(x2 - x1, 0) * max(y2 - y1, 0))
-    if area < 5000:
-        return "Light"
-    elif area < 15000:
-        return "Medium"
+def get_damage_severity(damage_counts):
+    """Menentukan tingkat kerusakan berdasarkan jumlah kerusakan"""
+    total_damage = sum(damage_counts.values())
+    
+    if total_damage == 0:
+        return "Baik"
+    elif total_damage <= 3:
+        return "Ringan"
+    elif total_damage <= 7:
+        return "Sedang"
     else:
-        return "Heavy"
+        return "Berat"
 
-def pil_to_bgr(pil_img: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+def process_single_image(model, image, car_id=""):
+    """Memproses satu gambar dan mendeteksi kerusakan"""
+    # Konversi PIL Image ke format yang bisa diproses YOLO
+    img_array = np.array(image)
+    
+    # Prediksi menggunakan model
+    results = model(img_array)
+    
+    # Inisialisasi hitungan kerusakan
+    damage_counts = {damage: 0 for damage in DAMAGE_CLASSES.values()}
+    
+    # Gambar hasil dengan overlay
+    annotated_image = img_array.copy()
+    
+    if len(results) > 0 and results[0].boxes is not None:
+        boxes = results[0].boxes
+        
+        for i, box in enumerate(boxes):
+            # Koordinat bounding box
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            
+            # Class dan confidence
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+            
+            if conf > 0.5:  # Threshold confidence
+                damage_type = DAMAGE_CLASSES.get(cls, "Unknown")
+                damage_counts[damage_type] += 1
+                
+                # Gambar bounding box
+                color = DAMAGE_COLORS.get(damage_type, (255, 255, 255))
+                cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
+                
+                # Label
+                label = f"{damage_type}: {conf:.2f}"
+                cv2.putText(annotated_image, label, (x1, y1-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    severity = get_damage_severity(damage_counts)
+    
+    return annotated_image, damage_counts, severity
 
-def bgr_to_pil(bgr: np.ndarray) -> Image.Image:
-    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+def create_damage_report(results_data):
+    """Membuat laporan kerusakan dalam format DataFrame"""
+    df_data = []
+    
+    for car_id, data in results_data.items():
+        row = {"ID_Mobil": car_id}
+        row.update(data["damage_counts"])
+        row["Status"] = data["severity"]
+        df_data.append(row)
+    
+    df = pd.DataFrame(df_data)
+    
+    # Reorder kolom
+    damage_cols = list(DAMAGE_CLASSES.values())
+    cols = ["ID_Mobil"] + damage_cols + ["Status"]
+    df = df.reindex(columns=cols, fill_value=0)
+    
+    return df
 
-def render_segmentation_on_bgr(img_bgr: np.ndarray, show_masks: bool, show_boxes: bool, show_labels: bool, mask_alpha: float):
-    """
-    Jalankan inference YOLO seg dan gambar mask/box/label sesuai setting.
-    Return (img_draw, records:list[dict]).
-    """
-    h, w = img_bgr.shape[:2]
-    results = model.predict(
-        source=img_bgr,
-        conf=CONF_THRES,
-        iou=IOU_THRES,
-        imgsz=IMG_SIZE,
-        verbose=False
+def create_zip_results(results_data):
+    """Membuat ZIP file berisi hasil deteksi"""
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for car_id, data in results_data.items():
+            # Simpan gambar hasil
+            img_pil = Image.fromarray(cv2.cvtColor(data["annotated_image"], cv2.COLOR_BGR2RGB))
+            img_buffer = io.BytesIO()
+            img_pil.save(img_buffer, format='PNG')
+            zip_file.writestr(f"{car_id}_detected.png", img_buffer.getvalue())
+            
+            # Simpan detail kerusakan
+            detail = {
+                "car_id": car_id,
+                "damage_counts": data["damage_counts"],
+                "severity": data["severity"],
+                "timestamp": data.get("timestamp", datetime.now().isoformat())
+            }
+            zip_file.writestr(f"{car_id}_detail.json", json.dumps(detail, indent=2))
+    
+    zip_buffer.seek(0)
+    return zip_buffer
+
+def main():
+    st.title("🚗 Sistem Identifikasi Kerusakan Mobil")
+    st.markdown("**Menggunakan YOLOv11 untuk Deteksi Otomatis Kerusakan Kendaraan**")
+    
+    # Load model
+    model = load_model()
+    if model is None:
+        st.error("Model tidak dapat dimuat. Pastikan file 'best.pt' tersedia.")
+        return
+    
+    # Sidebar
+    st.sidebar.header("⚙️ Pengaturan")
+    mode = st.sidebar.selectbox(
+        "Pilih Mode Operasi:",
+        ["Upload Foto Tunggal", "Batch Processing (ZIP)", "Scan Real-time"]
     )
-    r = results[0]
-    overlay = img_bgr.copy()
-    records = []
+    
+    # Info kerusakan yang dapat dideteksi
+    st.sidebar.markdown("### 🔍 Jenis Kerusakan:")
+    for damage in DAMAGE_CLASSES.values():
+        color_hex = "#{:02x}{:02x}{:02x}".format(*DAMAGE_COLORS[damage])
+        st.sidebar.markdown(f"<span style='color:{color_hex}'>●</span> {damage}", unsafe_allow_html=True)
+    
+    # Mode Upload Foto Tunggal
+    if mode == "Upload Foto Tunggal":
+        st.header("📷 Upload Foto Mobil")
+        
+        uploaded_file = st.file_uploader(
+            "Pilih foto mobil:",
+            type=['png', 'jpg', 'jpeg'],
+            help="Upload foto mobil dalam format PNG, JPG, atau JPEG"
+        )
+        
+        car_id = st.text_input("ID/Plat Mobil (opsional):", value="MOBIL_001")
+        
+        if uploaded_file is not None:
+            # Tampilkan gambar asli
+            image = Image.open(uploaded_file)
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Gambar Asli")
+                st.image(image, caption="Foto mobil yang diupload", use_column_width=True)
+            
+            if st.button("🔍 Deteksi Kerusakan", type="primary"):
+                with st.spinner("Memproses deteksi..."):
+                    annotated_img, damage_counts, severity = process_single_image(model, image, car_id)
+                
+                with col2:
+                    st.subheader("Hasil Deteksi")
+                    st.image(annotated_img, caption="Hasil deteksi kerusakan", use_column_width=True)
+                
+                # Ringkasan hasil
+                st.subheader("📊 Ringkasan Kerusakan")
+                col3, col4 = st.columns(2)
+                
+                with col3:
+                    st.metric("Status Kerusakan", severity)
+                    st.metric("Total Kerusakan", sum(damage_counts.values()))
+                
+                with col4:
+                    for damage, count in damage_counts.items():
+                        if count > 0:
+                            st.metric(damage, count)
+                
+                # Tabel detail
+                df_single = pd.DataFrame([{
+                    "ID_Mobil": car_id,
+                    **damage_counts,
+                    "Status": severity
+                }])
+                
+                st.subheader("📋 Detail Kerusakan")
+                st.dataframe(df_single, use_container_width=True)
+    
+    # Mode Batch Processing
+    elif mode == "Batch Processing (ZIP)":
+        st.header("📦 Batch Processing - Upload ZIP")
+        st.markdown("Upload file ZIP berisi foto-foto mobil untuk diproses secara batch.")
+        
+        uploaded_zip = st.file_uploader(
+            "Upload file ZIP:",
+            type=['zip'],
+            help="ZIP harus berisi foto-foto mobil (PNG, JPG, JPEG)"
+        )
+        
+        if uploaded_zip is not None:
+            if st.button("🚀 Proses Batch", type="primary"):
+                results_data = {}
+                
+                # Ekstrak dan proses ZIP
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    with zipfile.ZipFile(uploaded_zip, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    
+                    # Cari semua file gambar
+                    image_files = []
+                    for root, dirs, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                image_files.append(os.path.join(root, file))
+                    
+                    if not image_files:
+                        st.error("Tidak ditemukan file gambar dalam ZIP.")
+                        return
+                    
+                    # Progress bar
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    # Proses setiap gambar
+                    for i, img_path in enumerate(image_files):
+                        car_id = os.path.splitext(os.path.basename(img_path))[0]
+                        status_text.text(f"Memproses {car_id}... ({i+1}/{len(image_files)})")
+                        
+                        try:
+                            image = Image.open(img_path)
+                            annotated_img, damage_counts, severity = process_single_image(model, image, car_id)
+                            
+                            results_data[car_id] = {
+                                "annotated_image": annotated_img,
+                                "damage_counts": damage_counts,
+                                "severity": severity,
+                                "timestamp": datetime.now().isoformat()
+                            }
+                        except Exception as e:
+                            st.warning(f"Gagal memproses {car_id}: {e}")
+                        
+                        progress_bar.progress((i + 1) / len(image_files))
+                    
+                    status_text.text("Selesai!")
+                
+                # Tampilkan hasil
+                if results_data:
+                    st.success(f"Berhasil memproses {len(results_data)} mobil!")
+                    
+                    # Statistik keseluruhan
+                    st.subheader("📈 Statistik Keseluruhan")
+                    severity_counts = {}
+                    total_damages = 0
+                    
+                    for data in results_data.values():
+                        severity = data["severity"]
+                        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+                        total_damages += sum(data["damage_counts"].values())
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total Mobil", len(results_data))
+                    with col2:
+                        st.metric("Total Kerusakan", total_damages)
+                    with col3:
+                        st.metric("Mobil Baik/Ringan", severity_counts.get("Baik", 0) + severity_counts.get("Ringan", 0))
+                    with col4:
+                        st.metric("Mobil Sedang/Berat", severity_counts.get("Sedang", 0) + severity_counts.get("Berat", 0))
+                    
+                    # Tabel laporan
+                    st.subheader("📋 Laporan Kerusakan")
+                    df_report = create_damage_report(results_data)
+                    st.dataframe(df_report, use_container_width=True)
+                    
+                    # Download options
+                    st.subheader("💾 Download Hasil")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # Download CSV
+                        csv_buffer = io.StringIO()
+                        df_report.to_csv(csv_buffer, index=False)
+                        st.download_button(
+                            "📄 Download CSV Report",
+                            data=csv_buffer.getvalue(),
+                            file_name=f"damage_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with col2:
+                        # Download ZIP results
+                        zip_results = create_zip_results(results_data)
+                        st.download_button(
+                            "📦 Download ZIP Hasil",
+                            data=zip_results.getvalue(),
+                            file_name=f"detection_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip"
+                        )
+                    
+                    # Tampilkan beberapa contoh hasil
+                    st.subheader("🖼️ Contoh Hasil Deteksi")
+                    sample_ids = list(results_data.keys())[:3]  # Tampilkan 3 contoh pertama
+                    
+                    cols = st.columns(len(sample_ids))
+                    for i, car_id in enumerate(sample_ids):
+                        with cols[i]:
+                            st.write(f"**{car_id}**")
+                            st.write(f"Status: {results_data[car_id]['severity']}")
+                            st.image(results_data[car_id]["annotated_image"], use_column_width=True)
+    
+    # Mode Real-time (placeholder)
+    elif mode == "Scan Real-time":
+        st.header("📹 Scan Real-time")
+        st.info("Fitur kamera real-time sedang dalam pengembangan.")
+        st.markdown("""
+        **Fitur yang akan tersedia:**
+        - Deteksi kerusakan langsung melalui kamera
+        - Preview hasil secara real-time
+        - Capture dan save hasil deteksi
+        """)
 
-    # Masks
-    if show_masks and hasattr(r, "masks") and r.masks is not None:
-        masks = r.masks.data.cpu().numpy()
-        if masks.size > 0:
-            clss = r.boxes.cls.cpu().numpy().astype(int) if (hasattr(r, "boxes") and r.boxes is not None and len(r.boxes) > 0) else [0] * masks.shape[0]
-            for mask, cls_id in zip(masks, clss):
-                mask_resized = cv2.resize(mask, (w, h))
-                m = mask_resized > 0.5
-                cname = r.names.get(cls_id, str(cls_id))
-                col = color_for(cname)
-                overlay[m] = (0.45 * np.array(col) + 0.55 * overlay[m]).astype(np.uint8)
-
-    # Blend
-    img_draw = cv2.addWeighted(
-        overlay,
-        mask_alpha if show_masks else 0,
-        img_bgr,
-        1 - (mask_alpha if show_masks else 0),
-        0,
-    )
-
-    # Boxes + Labels
-    if hasattr(r, "boxes") and r.boxes is not None and len(r.boxes) > 0:
-        xyxy = r.boxes.xyxy.cpu().numpy()
-        clss = r.boxes.cls.cpu().numpy().astype(int)
-        confs = r.boxes.conf.cpu().numpy()
-        names = r.names
-
-        for box, cid, conf in zip(xyxy, clss, confs):
-            x1, y1, x2, y2 = box.astype(int)
-            cname = names.get(cid, str(cid))
-            col = color_for(cname)
-            if show_boxes:
-                cv2.rectangle(img_draw, (x1, y1), (x2, y2), col, 3)
-            if show_labels:
-                put_label(img_draw, cname, x1, y1)
-
-            records.append({
-                "class_name": cname,
-                "severity": severity_from_bbox(box),
-                "confidence": float(conf),
-                "bbox": [int(v) for v in [x1, y1, x2, y2]],
-            })
-
-    return img_draw, records
-
-# ==========================
-# SIDEBAR (GLOBAL SETTINGS) — gunakan key unik
-# ==========================
-with st.sidebar:
-    st.header("⚙️ Settings")
-    show_boxes = st.checkbox("Show Bounding Boxes", value=True, key="sb_show_boxes")
-    show_masks = st.checkbox("Show Segmentation Masks", value=True, key="sb_show_masks")
-    show_labels = st.checkbox("Show Class Labels", value=True, key="sb_show_labels")
-    mask_alpha = st.slider("Mask Opacity", 0.0, 1.0, 0.55, 0.05, key="sb_mask_alpha")
-
-    st.markdown("---")
-    st.caption("📸 Gunakan kamera untuk capture satu foto, atau upload beberapa gambar sekaligus.")
-
-# ==========================
-# LAYOUT: 2 TABS (Capture | Upload)
-# ==========================
-tab_cap, tab_upload = st.tabs(["📷 Capture from Camera", "🖼️ Upload Images"])
-
-# ---------- TAB: CAMERA CAPTURE ----------
-with tab_cap:
-    st.subheader("📷 Ambil Foto dari Kamera")
-    st.caption("Di ponsel, biasanya default ke kamera belakang. Di desktop, browser memilih kamera yang tersedia.")
-    img_file = st.camera_input("Ambil foto", key="cap_camera_input", help="Klik tombol kamera untuk mengambil gambar.")
-
-    if img_file is not None:
-        try:
-            pil = Image.open(img_file)
-            bgr = pil_to_bgr(pil)
-            img_draw, records = render_segmentation_on_bgr(bgr, show_masks, show_boxes, show_labels, mask_alpha)
-
-            st.image(bgr_to_pil(img_draw), use_container_width=True)
-
-            if records:
-                df_rec = pd.DataFrame(records)[["class_name", "severity", "confidence", "bbox"]]
-                st.caption("Ringkasan deteksi (confidence hanya ditampilkan di tabel):")
-                st.dataframe(df_rec, use_container_width=True)
-            else:
-                st.info("Tidak ada deteksi pada foto ini.")
-
-            # Download tombol (key unik)
-            buf = io.BytesIO()
-            bgr_to_pil(img_draw).save(buf, format="PNG")
-            st.download_button(
-                label="⬇️ Download annotated image (PNG)",
-                data=buf.getvalue(),
-                file_name=f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}_annotated.png",
-                mime="image/png",
-                key=f"dl_cap_{datetime.now().strftime('%H%M%S%f')}"
-            )
-        except Exception as e:
-            st.error(f"Gagal memproses foto kamera: {e}")
-
-# ---------- TAB: UPLOAD IMAGES ----------
-with tab_upload:
-    st.subheader("🖼️ Upload Image untuk Deteksi")
-    files = st.file_uploader(
-        "Pilih 1 atau beberapa gambar",
-        type=["jpg", "jpeg", "png", "bmp", "webp"],
-        accept_multiple_files=True,
-        help="Gambar akan dianotasi dengan mask/box/label sesuai pengaturan di sidebar.",
-        key="up_file_uploader"
-    )
-
-    if files:
-        for i, f in enumerate(files, start=1):
-            try:
-                pil = Image.open(f)
-            except Exception as e:
-                st.error(f"Gagal membuka file {f.name}: {e}")
-                continue
-
-            bgr = pil_to_bgr(pil)
-            img_draw, records = render_segmentation_on_bgr(bgr, show_masks, show_boxes, show_labels, mask_alpha)
-
-            st.markdown(f"**#{i}. {f.name}**")
-            st.image(bgr_to_pil(img_draw), use_container_width=True)
-
-            if records:
-                df_rec = pd.DataFrame(records)[["class_name", "severity", "confidence", "bbox"]]
-                st.caption("Ringkasan deteksi (confidence hanya ditampilkan di tabel):")
-                st.dataframe(df_rec, use_container_width=True, key=f"df_rec_{i}")
-            else:
-                st.info("Tidak ada deteksi pada gambar ini.", icon="ℹ️")
-
-            # Download tombol tiap item (key unik per item)
-            buf = io.BytesIO()
-            bgr_to_pil(img_draw).save(buf, format="PNG")
-            st.download_button(
-                label="⬇️ Download annotated image (PNG)",
-                data=buf.getvalue(),
-                file_name=f"{Path(f.name).stem}_annotated.png",
-                mime="image/png",
-                key=f"dl_up_{i}_{Path(f.name).stem}"
-            )
-            st.markdown("---")
-
-# ==========================
-# FOOTER
-# ==========================
-st.caption("🧠 YOLO instance segmentation — label on-frame tanpa confidence; confidence tersedia di tabel.")
+if __name__ == "__main__":
+    main()
