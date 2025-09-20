@@ -417,10 +417,10 @@ def show_results_step():
     total_damages = sum(sum(c['total_damages'].values()) for c in st.session_state.processed_results)
     heavy = sum(1 for c in st.session_state.processed_results if c['severity'][0] == 'Heavy')
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("🚗 Total Mobil", total_cars)
-    c2.metric("🔍 Total Kerusakan", total_damages)
-    c3.metric("⚠️ Kerusakan Berat", heavy)
-    c4.metric("✅ Success Rate", "100%")
+    c1.metric("🚗 Cars in Queue", total_cars)
+    c2.metric("🔍 Total Damage Found", total_damages)
+    c3.metric("⚠️ Heavy Damage Cars", heavy)
+    c4.metric("✅ Cars Processed", "100%")
 
     st.markdown("---")
 
